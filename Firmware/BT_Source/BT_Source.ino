@@ -1,60 +1,79 @@
-/**
- * @file base-i2s-a2dp.ino
- * @author Phil Schatzmann
- * @brief see https://github.com/pschatzmann/arduino-audio-tools/blob/main/examples/base-i2s-a2dp/README.md
-  * @copyright GPLv3
+/*
+  Streaming of sound data with Bluetooth to other Bluetooth device.
+  We generate 2 tones which will be sent to the 2 channels.
+  
+  Copyright (C) 2020 Phil Schatzmann
+  This program is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+  You should have received a copy of the GNU General Public License
+  along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
+#include "BluetoothA2DPSource.h"
+#include <math.h>
+#include "esp_log.h"
 
-#include "AudioTools.h"
-#include "AudioLibs/AudioA2DP.h"
-
-/**
- * @brief We use a INMP441 I2S microphone as input and send the data to A2DP
- * Unfortunatly the data type from the microphone (int32_t)  does not match with the required data type by A2DP (int16_t),
- * so we need to convert.
- */ 
+#define c3_frequency 130.81
 
 BluetoothA2DPSource a2dp_source;
-I2SStream i2s;
-ConverterFillLeftAndRight<int16_t> bothChannels(LeftIsEmpty);
-const size_t max_buffer_len = 150;
-const int channels = 2;
-const size_t max_buffer_bytes = max_buffer_len * sizeof(int16_t) * channels;
-uint8_t buffer[max_buffer_bytes]={0};
 
-// callback used by A2DP to provide the sound data - usually len is 128 2 channel int16 frames
-int32_t get_sound_data(Frame* data, int32_t len) {
-  size_t req_bytes = min(max_buffer_bytes, len*2*sizeof(int16_t));
-  // the microphone provides data in int32_t -> we read it into the buffer of int32_t data so *2
-  size_t result_bytes = i2s.readBytes((uint8_t*)buffer, req_bytes*2);
-  // we have data only in 1 channel but we want to fill both
-  return bothChannels.convert((uint8_t*)buffer, result_bytes);
+// The supported audio codec in ESP32 A2DP is SBC. SBC audio stream is encoded
+// from PCM data normally formatted as 44.1kHz sampling rate, two-channel 16-bit sample data
+int32_t get_data_channels(Frame *frame, int32_t channel_len) {
+  size_t result = 0;
+  uint32_t samples[256];
+  
+  i2s_read(I2S_NUM_0, samples, channel_len * 8, &result, portMAX_DELAY);
+
+  for (int i = 0; i < channel_len; i++) {
+    frame[i].channel1 = samples[i*2]>>16;
+    frame[i].channel2 = samples[i*2+1]>>16;
+  }
+  Serial.printf("res: %d\n", result);
+
+  return channel_len;
 }
 
+void setup() {
+  // Serial.begin(115200);
+  a2dp_source.set_auto_reconnect(false);
+  a2dp_source.start("[AV] Samsung Soundbar Q6T-Series", get_data_channels);
+  a2dp_source.set_volume(100);
 
-// Arduino Setup
-void setup(void) {
-  Serial.begin(115200);
-  AudioLogger::instance().begin(Serial, AudioLogger::Info);
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = 44100,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,  // Interrupt level 1, default 0
+    .dma_buf_count = 10,
+    .dma_buf_len = 64,
+    .use_apll = true,
+    .tx_desc_auto_clear = false,
+    .mclk_multiple = I2S_MCLK_MULTIPLE_256
+  };
 
-  // start i2s input with default configuration
-  Serial.println("starting I2S...");
-  auto cfg = i2s.defaultConfig(RX_MODE);
-  cfg.i2s_format = I2S_STD_FORMAT; // or try with I2S_LSB_FORMAT
-  cfg.bits_per_sample = 16;
-  cfg.channels = 2;
-  cfg.sample_rate = 44100;
-  cfg.is_master = true;
-  cfg.pin_bck = 14;
-  cfg.pin_ws = 15;
-  cfg.pin_data_rx = 22;
-  i2s.begin(cfg);
 
-  // start the bluetooth
-  Serial.println("starting A2DP...");
-  a2dp_source.start("MY2402YL", get_sound_data);  
+  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+
+  static const i2s_pin_config_t pin_config = {
+    .bck_io_num = 14,
+    .ws_io_num = 15,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = 22
+  };
+
+  i2s_set_pin(I2S_NUM_0, &pin_config);
+  uint32_t bits_cfg = (I2S_BITS_PER_CHAN_32BIT << 16) | I2S_BITS_PER_SAMPLE_32BIT;
+  i2s_set_clk(I2S_NUM_0, 44100, bits_cfg, I2S_CHANNEL_STEREO);
 }
 
-// Arduino loop - repeated processing 
 void loop() {
+  delay(10);
 }
