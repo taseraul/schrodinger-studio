@@ -1,0 +1,54 @@
+/*  Complete project details: https://randomnerdtutorials.com/esp32-web-server-websocket-sliders/  */
+
+html {
+  font-family: Arial, Helvetica, sans-serif;
+  display: inline-block;
+  text-align: center;
+}
+
+h1 {
+  font-size: 1.8rem;
+  color: white;
+}
+
+p {
+  font-size: 1.4rem;
+}
+
+.topnav {
+  overflow: hidden;
+  background-color: #0A1128;
+}
+
+body {
+  margin: 0;
+}
+
+.content {
+  display: flex;
+  flex-direction: row;
+  justify-content: space-between;
+  width: 100%;
+  height: 100%;
+}
+
+#device-controls {
+  background-color: aqua;
+  margin: auto;
+  flex: 1;
+  height: 100%;
+}
+
+#lyrics {
+  background-color: brown;
+  margin: auto;
+  flex: 2;
+  height: 100%;
+}
+
+#device-list {
+  background-color: chocolate;
+  margin: auto;
+  flex: 1;
+  height: 100%;
+}

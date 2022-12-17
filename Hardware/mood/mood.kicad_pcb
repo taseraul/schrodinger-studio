@@ -1033,6 +1033,11 @@
       (scale (xyz 1 1 1))
       (rotate (xyz 0 0 0))
     )
+    (model "D:/weMeshUP/OneDrive/Eagle lib/Kicad_lib/3D/12401610E4#2A.stp"
+      (offset (xyz 0 -5 1.5))
+      (scale (xyz 1 1 1))
+      (rotate (xyz 0 0 90))
+    )
   )
 
   (footprint "Resistor_SMD:R_0603_1608Metric_Pad0.98x0.95mm_HandSolder" (layer "F.Cu")
