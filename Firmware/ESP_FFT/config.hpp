@@ -7,8 +7,10 @@
 //FFT
 
 #define NUM_BANDS 6
-#define NOISE 200000
-#define LOWER_ATTENUATION (double)4000000.0
+#define DECAY 500
+#define FALLBACK_ATTENUATION (double)4000000.0
+#define MAX_SLOPE 0.2
+#define LIGHT_CUTOFF 0.2
 
 //I2S
 #define SAMPLING_FREQ 44100

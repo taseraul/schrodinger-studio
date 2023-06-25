@@ -24,23 +24,18 @@ void wifi_init() {
 
   // Set the device as a Station and Soft Access Point simultaneously
   WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP("Schrodinger");
+
   // Set device as a Wi-Fi Station
   WiFi.begin(ssid, password);
-  WiFi.softAPdisconnect();
   while ((WiFi.status() != WL_CONNECTED) && counter--) {
     delay(1000);
     Serial.println("Setting as a Wi-Fi Station..");
   }
-  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.mode(WIFI_AP_STA);
-
-    WiFi.disconnect();
-    WiFi.softAP("Schrodinger");
-  }
 
   Serial.print("Server SOFT AP MAC Address:  ");
   Serial.println(WiFi.softAPmacAddress());
-  WiFi.macAddress(lightDataMac());
+  WiFi.macAddress(setLightDataMac());
 
   channel = WiFi.channel();
   Serial.print("Station IP Address: ");

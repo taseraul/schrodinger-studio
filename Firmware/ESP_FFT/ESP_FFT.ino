@@ -13,6 +13,7 @@ void setup() {
   wifi_init();
   now_init();
   webserver_init();
+  init_fft();
 
   Serial.println("START");
 }

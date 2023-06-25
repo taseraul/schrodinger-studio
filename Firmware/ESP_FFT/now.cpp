@@ -118,7 +118,7 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
         memcpy(moodConfig.devices[index].macAddr, mac_addr, 6);
         moodConfig.devices[index].setId = index;
         moodConfig.devices[index].channel = get_channel();
-        moodConfig.devices[index].band = index % 4;
+        moodConfig.devices[index].band = index % 6;
         moodConfig.devices[index].msgType = CONF_PACKET;
         Serial.println("send pair response");
         addPeer(mac_addr, get_channel());

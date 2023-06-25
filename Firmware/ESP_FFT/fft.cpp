@@ -1,5 +1,5 @@
-#include <math.h>
 #include <arduinoFFT.h>
+#include <math.h>
 
 #include "fft.hpp"
 #include "i2s.hpp"
@@ -7,8 +7,13 @@
 
 struct_message lightData;
 
+uint64_t bandHistoryLow[NUM_BANDS];
+uint64_t bandHistoryHigh[NUM_BANDS];
+uint64_t bandDecayLow[NUM_BANDS];
+uint64_t bandDecayHigh[NUM_BANDS];
 uint64_t bandValues[NUM_BANDS];
-double bands_normalized[NUM_BANDS];
+float bands_normalized[NUM_BANDS];
+float prev_bands_normalized[NUM_BANDS];
 double vReal[SAMPLES];
 double vImag[SAMPLES];
 
@@ -20,10 +25,7 @@ void process_samples_for_fft() {
     vReal[i] += (int16_t)(get_sample(i * 2 + 1) >> 16);
     vReal[i] /= 2;
     vImag[i] = 0;
-    // Serial.print(" ");
-    // Serial.print(vReal[i]);
   }
-  // Serial.println(" ");
 }
 
 void compute_fft() {
@@ -32,71 +34,94 @@ void compute_fft() {
   FFT.ComplexToMagnitude();
 }
 
-uint8_t *lightDataMac() {
+uint8_t* setLightDataMac() {
   return lightData.server_mac;
 }
 
 void calculate_bands_amplitude() {
   for (int i = 2; i < (SAMPLES / 2); i++) {
-    // if (vReal[i] > NOISE) {
-
-      if (i <= 3) {
-        if ((int)vReal[i] > bandValues[0])
-          bandValues[0] = (int)vReal[i];
-      }
-      if (i > 3 && i <= 7) {
-        if ((int)vReal[i] > bandValues[1])
-          bandValues[1] = (int)vReal[i];
-      }
-      if (i > 7 && i <= 18) {
-        if ((int)vReal[i] > bandValues[2])
-          bandValues[2] = (int)vReal[i];
-      }
-      if (i > 18 && i <= 48) {
-        if ((int)vReal[i] > bandValues[3])
-          bandValues[3] = (int)vReal[i];
-      }
-      if (i > 48 && i <= 128) {
-        if ((int)vReal[i] > bandValues[4])
-          bandValues[4] = (int)vReal[i];
-      }
-      if (i > 128) {
-        if ((int)vReal[i] > bandValues[5])
-          bandValues[5] = (int)vReal[i];
-      }
-    // }
-    // Serial.print(" ");
-    // Serial.print(vReal[i]);
+    if (i <= 3) {
+      if ((int)vReal[i] > bandValues[0])
+        bandValues[0] = (int)vReal[i];
+    }
+    if (i > 3 && i <= 7) {
+      if ((int)vReal[i] > bandValues[1])
+        bandValues[1] = (int)vReal[i];
+    }
+    if (i > 7 && i <= 18) {
+      if ((int)vReal[i] > bandValues[2])
+        bandValues[2] = (int)vReal[i];
+    }
+    if (i > 18 && i <= 48) {
+      if ((int)vReal[i] > bandValues[3])
+        bandValues[3] = (int)vReal[i];
+    }
+    if (i > 48 && i <= 128) {
+      if ((int)vReal[i] > bandValues[4])
+        bandValues[4] = (int)vReal[i];
+    }
+    if (i > 128) {
+      if ((int)vReal[i] > bandValues[5])
+        bandValues[5] = (int)vReal[i];
+    }
   }
-  // Serial.println(" ");
-
-  // Serial.print(" ");
-  // Serial.print(bandValues[0]);
-  // Serial.print(" ");
-  // Serial.print(bandValues[1]);
-  // Serial.print(" ");
-  // Serial.print(bandValues[2]);
-  // Serial.print(" ");
-  // Serial.print(bandValues[3]);
-  // Serial.print(" ");
-  // Serial.print(bandValues[4]);
-  // Serial.print(" ");
-  // Serial.print(bandValues[5]);
-  // Serial.println(" ");
 }
 
 void normalize_bands() {
+  float band_norm_val;
   for (int i = 0; i < NUM_BANDS; i++) {
-    bands_normalized[i] = bandValues[i] / LOWER_ATTENUATION;
-    if (bands_normalized[i] > 1) {
-      bands_normalized[i] = 1;
-    }
-    lightData.bands[i] = bands_normalized[i] * 255;
 
-    // Serial.print(" ");
-    // Serial.print(bands_normalized[i]);
+    if (((bandHistoryLow[i] + bandDecayLow[i]) > bandHistoryLow[i]) && (bandHistoryHigh[i] > (bandHistoryLow[i] + bandHistoryLow[i]))) {
+      bandHistoryLow[i] += bandDecayLow[i];
+      bandDecayLow[i] *= 1.1;
+    }
+
+    if (((bandHistoryHigh[i] - bandDecayHigh[i]) < bandHistoryHigh[i]) && ((bandHistoryHigh[i] - bandDecayHigh[i]) > bandHistoryLow[i])) {
+      bandHistoryHigh[i] -= bandDecayHigh[i];
+      bandDecayHigh[i] *= 1.3;
+    }
+
+    if (bandHistoryLow[i] > bandValues[i]) {
+      bandHistoryLow[i] = bandValues[i];
+      bandDecayLow[i] = DECAY;
+    }
+
+    if (bandHistoryHigh[i] < bandValues[i]) {
+      bandHistoryHigh[i] = bandValues[i];
+      bandDecayHigh[i] = DECAY;
+    }
+
+    if ((bandHistoryHigh[i] - bandHistoryLow[i]) > (10 * DECAY)) {
+      band_norm_val = (bandValues[i] - bandHistoryLow[i]) / (float)(bandHistoryHigh[i] - bandHistoryLow[i]);
+    } else {
+      band_norm_val = 0;
+    }
+    if ((band_norm_val - prev_bands_normalized[i]) < -MAX_SLOPE) {
+      band_norm_val = prev_bands_normalized[i] - MAX_SLOPE;
+    }
+
+    bands_normalized[i] = band_norm_val;
+    prev_bands_normalized[i] = bands_normalized[i];
+    
+    // if (i == 0) {
+    //   Serial.print("diff:");
+    //   Serial.print((bandHistoryHigh[i] - bandHistoryLow[i]));
+    //   Serial.print(",");
+
+    //   Serial.print("low:");
+    //   Serial.print(bandHistoryLow[i]);
+    //   Serial.print(",");
+
+    //   Serial.print("high:");
+    //   Serial.print(bandHistoryHigh[i]);
+    //   Serial.print(",");
+
+    //   Serial.print("val:");
+    //   Serial.println(bandValues[i]);
+    // }
+
+    lightData.bands[i] = bands_normalized[i] * 255;
   }
-  // Serial.println(" ");
 }
 
 void reset_bands() {
@@ -111,10 +136,6 @@ void process_fft() {
   calculate_bands_amplitude();
   normalize_bands();
   reset_bands();
-}
-
-double get_band_normalized(int i) {
-  return bands_normalized[i];
 }
 
 void send_light_data() {
@@ -144,4 +165,9 @@ void send_light_data() {
   lightData.b[5] = 255;
 
   now_send_light(&lightData);
+}
+
+void init_fft() {
+  std::fill_n(bandDecayLow, NUM_BANDS, DECAY);
+  std::fill_n(bandDecayHigh, NUM_BANDS, DECAY);
 }
