@@ -1,15 +1,22 @@
-#include <WiFi.h>
 #include "now.hpp"
 #include <Arduino_JSON.h>
+#include <WiFi.h>
 #include <esp_now.h>
 #include "webserver.hpp"
 
-esp_now_peer_info_t slave;
-struct_pairing pairingData;
-device_handler moodConfig;
-uint8_t broadcastAddr[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+device_handler moodConfig[MAX_DEVICES];
+uint8_t        deviceCount;
+uint8_t        broadcastAddr[]     = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+uint8_t        defaultColors[6][3] = {
+    {0xFF, 0x00, 0x00},
+    {0x00, 0xFF, 0x00},
+    {0x00, 0x00, 0xFF},
+    {0xFF, 0x70, 0x00},
+    {0x00, 0xD0, 0xFF},
+    {0x99, 0x00, 0xFF},
+};
 
-void addPeer(const uint8_t *mac_addr, uint8_t chan) {
+void addPeer(const uint8_t* mac_addr, uint8_t chan) {
   esp_now_peer_info_t peer;
   esp_now_del_peer(mac_addr);
   memset(&peer, 0, sizeof(esp_now_peer_info_t));
@@ -22,124 +29,204 @@ void addPeer(const uint8_t *mac_addr, uint8_t chan) {
   }
 }
 
-String deviceToJson(uint8_t index) {
+static void populateDevice(uint8_t index) {
   JSONVar deviceInstance;
-  
-  deviceInstance["msgType"] = CONF_PACKET;
-  deviceInstance["id"] = moodConfig.devices[index].setId;
-  deviceInstance["band"] = moodConfig.devices[index].band;
-  deviceInstance["battery"] = moodConfig.devices[index].battery;
-  char macStr[18];
-  snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
-           moodConfig.devices[index].macAddr[0], moodConfig.devices[index].macAddr[1], moodConfig.devices[index].macAddr[2], moodConfig.devices[index].macAddr[3], moodConfig.devices[index].macAddr[4], moodConfig.devices[index].macAddr[5]);
-  String mac(macStr);
-  deviceInstance["mac"] = mac;
 
-  return JSON.stringify(deviceInstance);
+  deviceInstance["id"]      = index;
+  deviceInstance["band"]    = moodConfig[index].band;
+  deviceInstance["lock"]    = moodConfig[index].lock;
+  deviceInstance["flash"]   = moodConfig[index].flash;
+  deviceInstance["battery"] = moodConfig[index].battery;
+  deviceInstance["r"]       = moodConfig[index].rgb[0];
+  deviceInstance["g"]       = moodConfig[index].rgb[1];
+  deviceInstance["b"]       = moodConfig[index].rgb[2];
+
+  notifyClients(JSON.stringify(deviceInstance));
 }
 
-void now_send_config(const struct_config *config) {
-  esp_err_t result = esp_now_send(broadcastAddr, (uint8_t *)config, sizeof(*config));
+void now_send_config(const struct_config* config) {
+  esp_err_t result = esp_now_send(broadcastAddr, (uint8_t*)config, sizeof(*config));
 }
 
-
-void now_send_light(const struct_message *message) {
-  esp_err_t result = esp_now_send(broadcastAddr, (uint8_t *)message, sizeof(*message));
+void now_send_light(const struct_message* message) {
+  esp_err_t result = esp_now_send(broadcastAddr, (uint8_t*)message, sizeof(*message));
 }
 
-void printMAC(const uint8_t *mac_addr) {
-  char macStr[18];
-  snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
-           mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
-  Serial.print(macStr);
+static void updateBattery(uint8_t battery, uint8_t index) {
+  JSONVar deviceUpdate;
+  deviceUpdate["id"]        = index;
+  deviceUpdate["battery"]   = battery;
+  moodConfig[index].battery = battery;
+  notifyClients(JSON.stringify(deviceUpdate));
 }
 
-void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  if (status != ESP_NOW_SEND_SUCCESS) {
-    Serial.print("Delivery Fail to ");
-    printMAC(mac_addr);
-    Serial.println();
-  }
+static void updateFlash(uint8_t flash, uint8_t index) {
+  JSONVar deviceUpdate;
+  deviceUpdate["id"]      = index;
+  deviceUpdate["flash"]   = flash;
+  moodConfig[index].flash = flash;
+  notifyClients(JSON.stringify(deviceUpdate));
 }
 
-int is_peer(const uint8_t *mac_addr, uint8_t *isPeer) {
-  *isPeer = 0;
-  for (int i = 0; i < moodConfig.deviceCount; i++) {
-    if (!memcmp(mac_addr, moodConfig.devices[i].macAddr, 6)) {
-      *isPeer = 1;
+static void updateLock(uint8_t lock, uint8_t index) {
+  JSONVar deviceUpdate;
+  deviceUpdate["id"]     = index;
+  deviceUpdate["lock"]   = lock;
+  moodConfig[index].lock = lock;
+  notifyClients(JSON.stringify(deviceUpdate));
+}
+
+static void updateBand(uint8_t band, uint8_t index) {
+  JSONVar deviceUpdate;
+  deviceUpdate["id"]     = index;
+  deviceUpdate["band"]   = band;
+  moodConfig[index].band = band;
+  notifyClients(JSON.stringify(deviceUpdate));
+}
+
+static void updateColor(const uint8_t* color, uint8_t index) {
+  JSONVar deviceUpdate;
+  deviceUpdate["id"]       = index;
+  deviceUpdate["r"]        = color[0];
+  deviceUpdate["g"]        = color[1];
+  deviceUpdate["b"]        = color[2];
+  moodConfig[index].rgb[0] = color[0];
+  moodConfig[index].rgb[1] = color[1];
+  moodConfig[index].rgb[2] = color[2];
+  notifyClients(JSON.stringify(deviceUpdate));
+}
+
+void OnDataSent(const uint8_t* mac_addr, esp_now_send_status_t status) {
+}
+
+int is_peer(const uint8_t* mac_addr) {
+  for (int i = 0; i < deviceCount; i++) {
+    if (memcmp(mac_addr, moodConfig[i].macAddr, 6) == 0) {
       return i;
     }
   }
-  return 0;
+  return NOT_PEER;
 }
 
-void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
-  Serial.print(len);
-  Serial.print(" bytes of data received from : ");
-  printMAC(mac_addr);
-  Serial.println();
-  String payload;
-  uint8_t isPeer;
-  uint8_t index;
-  uint8_t type = incomingData[0];
-  switch (type) {
-    case CONF_PACKET:
-      Serial.println("CONF PACKET");
-      index = is_peer(mac_addr, &isPeer);
-      if (isPeer) {
-        memcpy((uint8_t *)&moodConfig.devices[index], incomingData, sizeof(struct_config));
-        notifyClients(deviceToJson(index));
-      }
+static void requestDeviceState(const uint8_t* mac_addr, uint8_t index) {
+  esp_err_t      result;
+  struct_request requestPacket;
+
+  requestPacket.destId         = index;
+  requestPacket.msgType        = SET_ID_PACKET;
+  requestPacket.preamble       = PREAMBLE;
+  requestPacket.requestLength  = 1;
+  requestPacket.requestData[0] = SET_REQUEST_STATE;
+
+  result = esp_now_send(mac_addr, (uint8_t*)&requestPacket, sizeof(requestPacket));
+}
+
+static void setDeviceState(const uint8_t* mac_addr, const uint8_t index) {
+  esp_err_t      result;
+  struct_request requestPacket;
+
+  requestPacket.destId         = index;
+  requestPacket.msgType        = SET_ID_PACKET;
+  requestPacket.preamble       = PREAMBLE;
+  requestPacket.requestLength  = 8;
+  requestPacket.requestData[0] = SET_BAND;
+  requestPacket.requestData[1] = moodConfig[index].band;
+  requestPacket.requestData[2] = moodConfig[index].flash ? SET_FLASH_ON : SET_FLASH_OFF;
+  requestPacket.requestData[3] = moodConfig[index].lock ? SET_LOCK : SET_UNLOCK;
+  requestPacket.requestData[4] = SET_BASE_COLOR;
+  requestPacket.requestData[5] = moodConfig[index].rgb[0];
+  requestPacket.requestData[6] = moodConfig[index].rgb[1];
+  requestPacket.requestData[7] = moodConfig[index].rgb[2];
+
+  result = esp_now_send(mac_addr, (uint8_t*)&requestPacket, sizeof(requestPacket));
+}
+
+static void pairDevice(const uint8_t* mac_addr, uint8_t battery) {
+  uint8_t       index;
+  esp_err_t     result;
+  struct_config config;
+  index = is_peer(mac_addr);
+
+  addPeer(mac_addr, get_channel());
+  config.preamble = PREAMBLE;
+  config.msgType  = CONF_PACKET;
+  config.channel  = get_channel();
+  setServerMac(config.macAddr);
+
+  if (index != NOT_PEER) {
+    config.setId              = index;
+    moodConfig[index].battery = battery;
+
+    result = esp_now_send(mac_addr, (uint8_t*)&config, sizeof(config));
+
+    updateBattery(battery, index);
+
+    if (result == ESP_OK)
+      setDeviceState(mac_addr, index);
+
+    esp_now_del_peer(mac_addr);
+  } else {
+
+    config.setId = deviceCount;
+
+    result = esp_now_send(mac_addr, (uint8_t*)&config, sizeof(config));
+
+    moodConfig[deviceCount].band     = deviceCount % 6;
+    moodConfig[deviceCount].battery  = battery;
+    moodConfig[deviceCount].isPaired = 1;
+    moodConfig[deviceCount].flash    = 0;
+    moodConfig[deviceCount].lock     = 0;
+    memcpy(moodConfig[deviceCount].macAddr, mac_addr, 6);
+    memcpy(moodConfig[deviceCount].rgb, defaultColors[deviceCount % 6], 3);
+
+    deviceCount++;
+
+    if (result == ESP_OK) {
+      populateDevice(config.setId);
+      setDeviceState(mac_addr, index);
+    }
+  }
+
+  esp_now_del_peer(mac_addr);
+}
+
+static void updateDevice(const struct_update* packet) {
+  switch (packet->updateType) {
+    case UPDATE_BATTERY:
+      updateBattery(packet->updateData[0], packet->sourceId);
       break;
-
-    case DATA_PACKET:
-      Serial.println("DATA PACKET");
+    case UPDATE_FLASH:
+      updateFlash(packet->updateData[0], packet->sourceId);
       break;
-
-    case PAIR_PACKET:
-      memcpy(&pairingData, incomingData, sizeof(pairingData));
-      index = is_peer(mac_addr, &isPeer);
-      Serial.print("Is peer : ");
-      Serial.println(isPeer);
-      Serial.print("Index : ");
-      Serial.println(index);
-
-      if (isPeer) {
-        Serial.println("resend pair response");
-        addPeer(mac_addr, get_channel());
-        esp_err_t result = esp_now_send(mac_addr, (uint8_t *)&moodConfig.devices[index], sizeof(struct_config));
-        esp_now_del_peer(mac_addr);
-      } else {
-        index = moodConfig.deviceCount;
-        Serial.print("Pairing request from: ");
-        printMAC(mac_addr);
-        Serial.println();
-        Serial.println(pairingData.channel);
-        memcpy(moodConfig.devices[index].macAddr, mac_addr, 6);
-        moodConfig.devices[index].setId = index;
-        moodConfig.devices[index].channel = get_channel();
-        moodConfig.devices[index].band = index % 6;
-        moodConfig.devices[index].msgType = CONF_PACKET;
-        Serial.println("send pair response");
-        addPeer(mac_addr, get_channel());
-        esp_err_t result = esp_now_send(mac_addr, (uint8_t *)&moodConfig.devices[index], sizeof(struct_config));
-        moodConfig.deviceCount++;
-        esp_now_del_peer(mac_addr);
-      }
-
-      notifyClients(deviceToJson(index));
-
-      Serial.print("Id : ");
-      Serial.println(moodConfig.devices[index].setId);
-      Serial.print("Band : ");
-      Serial.println(moodConfig.devices[index].band);
-      Serial.print("Battery : ");
-      Serial.println(moodConfig.devices[index].battery);
-      Serial.print("Channel : ");
-      Serial.println(moodConfig.devices[index].channel);
-
+    case UPDATE_LOCK:
+      updateLock(packet->updateData[0], packet->sourceId);
+      break;
+    case UPDATE_BAND:
+      updateBand(packet->updateData[0], packet->sourceId);
+      break;
+    case UPDATE_COLOR:
+      updateColor(packet->updateData, packet->sourceId);
       break;
   }
+}
+
+void OnDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
+  Serial.print("pair req");
+  String payload;
+  // if (incomingData[0] == PREAMBLE) {
+    uint8_t type = incomingData[0];
+    switch (type) {
+
+      case PAIR_PACKET:
+        pairDevice(mac_addr, incomingData[1]);
+        break;
+      case UPDATE_PACKET:
+        updateDevice((const struct_update*)incomingData);
+        break;
+    }
+  // }
+  // else
+  //   Serial.print("pair fail");
 }
 
 void now_init() {

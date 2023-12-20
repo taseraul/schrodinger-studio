@@ -35,13 +35,16 @@ void wifi_init() {
 
   Serial.print("Server SOFT AP MAC Address:  ");
   Serial.println(WiFi.softAPmacAddress());
-  WiFi.macAddress(setLightDataMac());
 
   channel = WiFi.channel();
   Serial.print("Station IP Address: ");
   Serial.println(WiFi.localIP());
   Serial.print("Wi-Fi Channel: ");
   Serial.println(WiFi.channel());
+}
+
+void setServerMac(uint8_t* mac){
+  WiFi.macAddress(mac);
 }
 
 // Initialize SPIFFS

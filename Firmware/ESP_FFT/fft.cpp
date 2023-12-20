@@ -4,6 +4,7 @@
 #include "fft.hpp"
 #include "i2s.hpp"
 #include "now.hpp"
+#include "webserver.hpp"
 
 struct_message lightData;
 
@@ -139,35 +140,13 @@ void process_fft() {
 }
 
 void send_light_data() {
-  lightData.msgType = DATA_PACKET;
-  lightData.r[0] = 255;
-  lightData.g[0] = 0;
-  lightData.b[0] = 0;
-
-  lightData.r[1] = 0;
-  lightData.g[1] = 255;
-  lightData.b[1] = 0;
-
-  lightData.r[2] = 0;
-  lightData.g[2] = 0;
-  lightData.b[2] = 255;
-
-  lightData.r[3] = 255;
-  lightData.g[3] = 255;
-  lightData.b[3] = 0;
-
-  lightData.r[4] = 0;
-  lightData.g[4] = 255;
-  lightData.b[4] = 255;
-
-  lightData.r[5] = 255;
-  lightData.g[5] = 0;
-  lightData.b[5] = 255;
-
   now_send_light(&lightData);
 }
 
 void init_fft() {
   std::fill_n(bandDecayLow, NUM_BANDS, DECAY);
   std::fill_n(bandDecayHigh, NUM_BANDS, DECAY);
+  setServerMac(lightData.server_mac);
+  lightData.preamble = PREAMBLE;
+  lightData.msgType = LIGHT_PACKET;
 }

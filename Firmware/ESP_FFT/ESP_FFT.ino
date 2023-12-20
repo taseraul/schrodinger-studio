@@ -7,6 +7,8 @@
 void setup() {
   Serial.begin(115200);
 
+  //TODO toggle debugging and use serial
+
   i2s_init();
   initFS();
 
