@@ -12,10 +12,10 @@ uint64_t bandHistoryHigh[NUM_BANDS];
 uint64_t bandDecayLow[NUM_BANDS];
 uint64_t bandDecayHigh[NUM_BANDS];
 uint64_t bandValues[NUM_BANDS];
-float bands_normalized[NUM_BANDS];
-float prev_bands_normalized[NUM_BANDS];
-double vReal[SAMPLES];
-double vImag[SAMPLES];
+float    bands_normalized[NUM_BANDS];
+float    prev_bands_normalized[NUM_BANDS];
+double   vReal[SAMPLES];
+double   vImag[SAMPLES];
 
 arduinoFFT FFT = arduinoFFT(vReal, vImag, SAMPLES, SAMPLING_FREQ);
 
@@ -69,44 +69,51 @@ void calculate_bands_amplitude() {
 
 void normalize_bands() {
   float band_norm_val;
+  float max_range = 0;
   for (int i = 0; i < NUM_BANDS; i++) {
 
-    if (((bandHistoryLow[i] + bandDecayLow[i]) > bandHistoryLow[i]) && (bandHistoryHigh[i] > (bandHistoryLow[i] + bandHistoryLow[i]))) {
-      bandHistoryLow[i] += bandDecayLow[i];
-      bandDecayLow[i] *= 1.05;
-    }
+    // if (((bandHistoryLow[i] + bandDecayLow[i]) > bandHistoryLow[i]) && (bandHistoryHigh[i] > (bandHistoryLow[i] + bandHistoryLow[i]))) {
+    //   bandHistoryLow[i] += bandDecayLow[i];
+    //   bandDecayLow[i] *= 1.05;
+    // }
 
-    if (((bandHistoryHigh[i] - bandDecayHigh[i]) < bandHistoryHigh[i]) && ((bandHistoryHigh[i] - bandDecayHigh[i]) > bandHistoryLow[i])) {
-      bandHistoryHigh[i] -= bandDecayHigh[i];
-      bandDecayHigh[i] *= 1.05;
-    }
+    // if (((bandHistoryHigh[i] - bandDecayHigh[i]) < bandHistoryHigh[i]) && ((bandHistoryHigh[i] - bandDecayHigh[i]) > bandHistoryLow[i])) {
+    //   bandHistoryHigh[i] -= bandDecayHigh[i];
+    //   bandDecayHigh[i] *= 1.05;
+    // }
 
-    if (bandHistoryLow[i] > bandValues[i]) {
-      bandHistoryLow[i] = bandValues[i];
-      bandDecayLow[i] = DECAY;
-    }
+    bandHistoryHigh[i] *= 0.98;
+
+    // if (bandHistoryLow[i] > bandValues[i]) {
+    //   bandHistoryLow[i] = bandValues[i];
+    //   bandDecayLow[i]   = DECAY;
+    // }
 
     if (bandHistoryHigh[i] < bandValues[i]) {
       bandHistoryHigh[i] = bandValues[i];
-      bandDecayHigh[i] = DECAY;
+    //   bandDecayHigh[i]   = DECAY;
     }
 
+    if (max_range < (bandHistoryHigh[i] - bandHistoryLow[i]))
+      max_range = (bandHistoryHigh[i] - bandHistoryLow[i]);
+
     if ((bandHistoryHigh[i] - bandHistoryLow[i]) > (20 * DECAY)) {
-      band_norm_val = (bandValues[i] - bandHistoryLow[i]) / (float)(bandHistoryHigh[i] - bandHistoryLow[i]);
+      band_norm_val = bandValues[i] / (float)bandHistoryHigh[i];
     } else {
       band_norm_val = 0;
     }
+
     if ((band_norm_val - prev_bands_normalized[i]) < -MAX_SLOPE) {
       band_norm_val = prev_bands_normalized[i] - MAX_SLOPE;
     }
-    
-    if(band_norm_val < LIGHT_CUTOFF){
+
+    if (band_norm_val < LIGHT_CUTOFF) {
       band_norm_val = 0;
     }
 
-    bands_normalized[i] = band_norm_val;
+    bands_normalized[i]      = band_norm_val;
     prev_bands_normalized[i] = bands_normalized[i];
-    
+
     // if (i == 0) {
     //   Serial.print("diff:");
     //   Serial.print((bandHistoryHigh[i] - bandHistoryLow[i]));
@@ -123,9 +130,30 @@ void normalize_bands() {
     //   Serial.print("val:");
     //   Serial.println(bandValues[i]);
     // }
-
     lightData.bands[i] = bands_normalized[i] * 255;
   }
+
+  // for (int i = 0; i < NUM_BANDS; i++) {
+
+  //   if ((bandHistoryHigh[i] - bandHistoryLow[i]) > (20 * DECAY)) {
+  //     band_norm_val = (bandValues[i] - bandHistoryLow[i]) / (float)max_range;
+  //   } else {
+  //     band_norm_val = 0;
+  //   }
+
+  //   if ((band_norm_val - prev_bands_normalized[i]) < -MAX_SLOPE) {
+  //     band_norm_val = prev_bands_normalized[i] - MAX_SLOPE;
+  //   }
+
+  //   if (band_norm_val < LIGHT_CUTOFF) {
+  //     band_norm_val = 0;
+  //   }
+
+  //   bands_normalized[i]      = band_norm_val;
+  //   prev_bands_normalized[i] = bands_normalized[i];
+
+  //   lightData.bands[i] = bands_normalized[i] * 255;
+  // }
 }
 
 void reset_bands() {
@@ -144,9 +172,9 @@ void process_fft() {
 
 void send_light_data() {
   lightData.msgType = DATA_PACKET;
-  lightData.r[0] = 255;
-  lightData.g[0] = 0;
-  lightData.b[0] = 0;
+  lightData.r[0]    = 255;
+  lightData.g[0]    = 0;
+  lightData.b[0]    = 0;
 
   lightData.r[1] = 0;
   lightData.g[1] = 255;
