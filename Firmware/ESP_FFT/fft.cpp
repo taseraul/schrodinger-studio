@@ -73,12 +73,12 @@ void normalize_bands() {
 
     if (((bandHistoryLow[i] + bandDecayLow[i]) > bandHistoryLow[i]) && (bandHistoryHigh[i] > (bandHistoryLow[i] + bandHistoryLow[i]))) {
       bandHistoryLow[i] += bandDecayLow[i];
-      bandDecayLow[i] *= 1.1;
+      bandDecayLow[i] *= 1.05;
     }
 
     if (((bandHistoryHigh[i] - bandDecayHigh[i]) < bandHistoryHigh[i]) && ((bandHistoryHigh[i] - bandDecayHigh[i]) > bandHistoryLow[i])) {
       bandHistoryHigh[i] -= bandDecayHigh[i];
-      bandDecayHigh[i] *= 1.3;
+      bandDecayHigh[i] *= 1.05;
     }
 
     if (bandHistoryLow[i] > bandValues[i]) {
@@ -91,13 +91,17 @@ void normalize_bands() {
       bandDecayHigh[i] = DECAY;
     }
 
-    if ((bandHistoryHigh[i] - bandHistoryLow[i]) > (10 * DECAY)) {
+    if ((bandHistoryHigh[i] - bandHistoryLow[i]) > (20 * DECAY)) {
       band_norm_val = (bandValues[i] - bandHistoryLow[i]) / (float)(bandHistoryHigh[i] - bandHistoryLow[i]);
     } else {
       band_norm_val = 0;
     }
     if ((band_norm_val - prev_bands_normalized[i]) < -MAX_SLOPE) {
       band_norm_val = prev_bands_normalized[i] - MAX_SLOPE;
+    }
+    
+    if(band_norm_val < LIGHT_CUTOFF){
+      band_norm_val = 0;
     }
 
     bands_normalized[i] = band_norm_val;
