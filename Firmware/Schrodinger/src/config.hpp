@@ -1,8 +1,8 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-#include <Arduino.h>
-#include <stdint.h>
+#include "Arduino.h"
+#include "stdint.h"
 
 //FFT
 #define NUM_BANDS 6
@@ -14,7 +14,7 @@
 #define MAX_LED_QUEUE 3
 
 //I2S,FFT
-#define SAMPLING_FREQ 44100
+#define SAMPLE_RATE 44100
 #define SAMPLES 512
 
 #endif

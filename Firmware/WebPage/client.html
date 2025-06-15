@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Device Monitor</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: sans-serif;
+      background: #f0f0f0;
+    }
+    .card {
+      width: 90vw;
+      height: 90vh;
+      margin: 5vh auto;
+      background: white;
+      border-radius: 1rem;
+      display: flex;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+      overflow: hidden;
+    }
+    .list {
+      width: 320px;
+      max-width: 100%;
+      overflow-y: auto;
+      border-right: 1px solid #ddd;
+      padding: 2rem;
+    }
+    .item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.5rem;
+      padding: 1rem;
+      margin-bottom: 1rem;
+      border-radius: 0.75rem;
+      background: #fafafa;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.05);
+      touch-action: manipulation;
+    }
+    .item select {
+      padding: 0.5rem;
+      border-radius: 0.5rem;
+      border: 1px solid #ccc;
+      font-size: 1rem;
+    }
+    .icon-btn {
+      font-size: 1.5rem;
+      background: none;
+      border: none;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+    .battery {
+      font-size: 1rem;
+      font-weight: bold;
+    }
+    .color-box {
+      width: 32px;
+      height: 32px;
+      border-radius: 0.5rem;
+      border: 1px solid #ccc;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="list" id="deviceList"></div>
+    <div id="right" style="flex: 1; padding: 2rem;">Right side content</div>
+  </div>
+
+  <input type="color" id="colorPicker" style="position: absolute; visibility: hidden;">
+
+  <script>
+    const loc = window.location;
+    const wsProtocol = loc.protocol === "https:" ? "wss" : "ws";
+    const socket = new WebSocket(`${wsProtocol}://${loc.hostname}/ws`);
+    const list = document.getElementById("deviceList");
+    const colorPicker = document.getElementById("colorPicker");
+    let currentColorEdit = null;
+
+    socket.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      const { id } = data;
+      let existing = document.getElementById(`device-${id}`);
+
+      if (!existing) {
+        // Only create new card if we have a full data packet (check key presence)
+        const requiredFields = ['band', 'lock', 'flash', 'battery', 'red', 'green', 'blue'];
+        const hasAllFields = requiredFields.every(k => k in data);
+        if (!hasAllFields) return; // Ignore partial updates if no existing card
+
+        existing = document.createElement("div");
+        existing.className = "item";
+        existing.id = `device-${id}`;
+        existing.innerHTML = `
+          <span>${id}</span>
+          <select onchange="sendField(${id}, 'band', this.value)">
+            ${[1,2,3,4,5,6].map(n => `<option value="${n}">${n}</option>`).join('')}
+          </select>
+          <button class="icon-btn" onclick="toggleIcon(this, 'lock', ${id})">🔓</button>
+          <button class="icon-btn" onclick="toggleIcon(this, 'flash', ${id})">💡</button>
+          <span class="battery" id="battery-${id}"></span>
+          <div class="color-box" id="color-${id}" onclick="pickColor(${id})"></div>
+        `;
+        list.appendChild(existing);
+      }
+
+      // Update values
+      if (data.band) existing.querySelector("select").value = data.band;
+      if (data.lock !== undefined) existing.querySelector(".icon-btn:nth-of-type(1)").textContent = data.lock ? '🔒' : '🔓';
+      if (data.flash !== undefined) existing.querySelector(".icon-btn:nth-of-type(2)").textContent = data.flash ? '💡' : '💤';
+      if (data.battery !== undefined) {
+        const batt = existing.querySelector(".battery");
+        batt.textContent = `${data.battery}%`;
+        batt.style.color = `rgb(${255 - data.battery * 2.55}, ${data.battery * 2.55}, 0)`;
+      }
+      if (data.red !== undefined && data.green !== undefined && data.blue !== undefined) {
+        existing.querySelector(".color-box").style.backgroundColor = `rgb(${data.red}, ${data.green}, ${data.blue})`;
+      }
+    };
+
+    socket.onopen = () => {
+      console.log('WebSocket connected');
+    };
+
+    socket.onclose = (e) => {
+      console.warn('WebSocket closed. Reconnecting in 1s...', e.reason);
+      setTimeout(connectWebSocket, reconnectInterval);
+    };
+
+    socket.onerror = (err) => {
+      console.error('WebSocket error', err);
+      ws.close(); // Trigger reconnect via onclose
+    };
+
+    function sendField(id, field, value) {
+      socket.send(JSON.stringify({ id, [field]: value }));
+    }
+
+    function toggleIcon(el, field, id) {
+      const current = el.textContent;
+      const state = (field === 'lock') ? current === '🔒' : current === '💡';
+      const newState = !state;
+      sendField(id, field, newState);
+    }
+
+    function pickColor(id) {
+      currentColorEdit = id;
+      colorPicker.click();
+    }
+
+    colorPicker.addEventListener("input", () => {
+      const hex = colorPicker.value;
+      const r = parseInt(hex.substr(1,2), 16);
+      const g = parseInt(hex.substr(3,2), 16);
+      const b = parseInt(hex.substr(5,2), 16);
+      socket.send(JSON.stringify({ id: currentColorEdit, red: r, green: g, blue: b }));
+    });
+  </script>
+</body>
+</html>

@@ -5,8 +5,8 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
-#define I2S_TASK_STACK_SIZE 512
-#define I2S_TASK_PRIORITY   18
+#define I2S_TASK_STACK_SIZE 8192
+#define I2S_TASK_PRIORITY   15
 
 static uint32_t samples[SAMPLES * 2];   // For writing from I2S
 
@@ -15,6 +15,33 @@ static SemaphoreHandle_t buffer_mutex;
 
 // Flag to indicate new data is ready
 static volatile bool buffer_ready = false;
+
+// High-priority task: reads samples from I2S
+void i2s_read_task(void *param) {
+  size_t bytes_read;
+  uint8_t temp_buffer[SAMPLES * 8];  // 2 channels × 4 bytes = 8 bytes/sample pair
+
+  while (true) {
+    // Non-blocking I2S read
+    esp_err_t res = i2s_read(
+      I2S_NUM_0,
+      temp_buffer,
+      sizeof(temp_buffer),
+      &bytes_read,
+      0 // non-blocking
+    );
+
+    if (res == ESP_OK && bytes_read == sizeof(temp_buffer)) {
+      if (xSemaphoreTake(buffer_mutex, 0)) {
+        memcpy(samples, temp_buffer, sizeof(temp_buffer));
+        buffer_ready = true;
+        xSemaphoreGive(buffer_mutex);
+      }
+    }
+
+    taskYIELD();  // Prevent CPU hogging
+  }
+}
 
 void i2s_init() {
   i2s_config_t i2s_config = {
@@ -55,33 +82,6 @@ void i2s_init() {
     NULL,
     0  // Pin to Core 0
   );
-}
-
-// High-priority task: reads samples from I2S
-void i2s_read_task(void *param) {
-  size_t bytes_read;
-  uint8_t temp_buffer[SAMPLES * 8];  // 2 channels × 4 bytes = 8 bytes/sample pair
-
-  while (true) {
-    // Non-blocking I2S read
-    esp_err_t res = i2s_read(
-      I2S_NUM_0,
-      temp_buffer,
-      sizeof(temp_buffer),
-      &bytes_read,
-      0 // non-blocking
-    );
-
-    if (res == ESP_OK && bytes_read == sizeof(temp_buffer)) {
-      if (xSemaphoreTake(buffer_mutex, 0)) {
-        memcpy(samples, temp_buffer, sizeof(temp_buffer));
-        buffer_ready = true;
-        xSemaphoreGive(buffer_mutex);
-      }
-    }
-
-    taskYIELD();  // Prevent CPU hogging
-  }
 }
 
 // Thread-safe, non-blocking access to the latest samples

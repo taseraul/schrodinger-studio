@@ -6,73 +6,72 @@
 #include "SPIFFS.h"
 #include <AsyncElegantOTA.h>
 
-// #include <Arduino_JSON.h>
-
-
-const char *ssid = "Home_mansarda";
-const char *password = "hifihifi1";
+// Wi-Fi credentials
+const char *ssid = "";
+const char *password = "";
 int channel;
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
+// Initialize Wi-Fi
 void wifi_init() {
-  uint8_t counter = 30;
+  uint8_t retryCount = 30;
   Serial.println();
-  Serial.print("Server MAC Address:  ");
+  Serial.print("Server MAC Address: ");
   Serial.println(WiFi.macAddress());
 
-  // Set the device as a Station and Soft Access Point simultaneously
+  // Set device as both Station and Soft AP
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP("Schrodinger");
 
-  // Set device as a Wi-Fi Station
   WiFi.begin(ssid, password);
-  while ((WiFi.status() != WL_CONNECTED) && counter--) {
+  while (WiFi.status() != WL_CONNECTED && retryCount--) {
     delay(1000);
-    Serial.println("Setting as a Wi-Fi Station..");
+    Serial.println("Connecting to Wi-Fi...");
   }
 
-  Serial.print("Server SOFT AP MAC Address:  ");
+  Serial.print("Soft AP MAC Address: ");
   Serial.println(WiFi.softAPmacAddress());
 
   channel = WiFi.channel();
   Serial.print("Station IP Address: ");
   Serial.println(WiFi.localIP());
   Serial.print("Wi-Fi Channel: ");
-  Serial.println(WiFi.channel());
-}
-
-void setServerMac(uint8_t* mac){
-  WiFi.macAddress(mac);
+  Serial.println(channel);
 }
 
 // Initialize SPIFFS
 void initFS() {
   if (!SPIFFS.begin()) {
-    Serial.println("An error has occurred while mounting SPIFFS");
+    Serial.println("Error mounting SPIFFS");
   } else {
     Serial.println("SPIFFS mounted successfully");
   }
 }
 
+// Handle incoming WebSocket messages (currently unused)
 void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
   AwsFrameInfo *info = (AwsFrameInfo *)arg;
   if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+    // Handle WebSocket text message here
   }
 }
 
-void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
+// WebSocket event handler
+void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
+             void *arg, uint8_t *data, size_t len) {
   switch (type) {
     case WS_EVT_CONNECT:
-      Serial.printf("WebSocket client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
+      Serial.printf("WebSocket client #%u connected from %s\n",
+                    client->id(), client->remoteIP().toString().c_str());
       break;
     case WS_EVT_DISCONNECT:
       Serial.printf("WebSocket client #%u disconnected\n", client->id());
       break;
     case WS_EVT_DATA:
-      Serial.println("WebSocket text message");
-      // handleWebSocketMessage(arg, data, len);
+      Serial.println("WebSocket text message received");
+      // handleWebSocketMessage(arg, data, len); // Enable if needed
       break;
     case WS_EVT_PONG:
     case WS_EVT_ERROR:
@@ -80,29 +79,27 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
   }
 }
 
+// Initialize WebSocket
 void initWebSocket() {
   ws.onEvent(onEvent);
   server.addHandler(&ws);
 }
 
+// Notify all WebSocket clients
 void notifyClients(String json) {
   ws.textAll(json);
 }
 
+// Initialize web server
 void webserver_init() {
   initWebSocket();
-  // Web Server Root URL
+
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(SPIFFS, "/index.html", "text/html");
   });
 
   server.serveStatic("/", SPIFFS, "/");
-  AsyncElegantOTA.begin(&server);  // Start ElegantOTA
+  AsyncElegantOTA.begin(&server); // Start ElegantOTA
 
-  // Start server
   server.begin();
-}
-
-int get_channel() {
-  return channel;
 }

@@ -3,11 +3,26 @@
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 #include "esp_dsp.h"
+// #include <dsp/transform.h>
+// #include <dsp/window.h>
 #include "config.hpp"
-#include <Arduino.h>
+#include "i2s.hpp"
+#include "bt.hpp"
+#include "Arduino.h"
+#include "arduinoFFT.h"
+
+// #define READ_SAMPLES read_all_samples
+#define READ_SAMPLES readBtSamples
 
 #define MAX_FREQ 10000
 #define MAX_BIN ((MAX_FREQ * SAMPLES) / SAMPLE_RATE)
+
+// Time constant for smoothing in seconds
+#define SMOOTH_TIME_SEC 10.0f
+
+// Derived alpha for exponential smoothing per FFT frame (assuming ~100 fps)
+#define FFT_FPS 100.0f
+#define ALPHA (1.0f - expf(-1.0f / (SMOOTH_TIME_SEC * FFT_FPS)))
 
 typedef struct {
   int index;
@@ -20,16 +35,16 @@ typedef struct {
 } peak_msg_t;
 
 static uint32_t samples_copy[SAMPLES * 2];
-static float fft_input[SAMPLES];
-static float fft_output[SAMPLES * 2];
-static float fft_mono[SAMPLES];
+static float fft_real[SAMPLES];
+static float fft_img[SAMPLES];
 
-static dsp_handle_t fft_handle = NULL;
 static QueueHandle_t peaks_queue = NULL;
 
+ArduinoFFT<float> FFT = ArduinoFFT<float>(fft_real, fft_img, SAMPLES, SAMPLE_RATE);
+
 static SemaphoreHandle_t config_mutex = NULL;
-static int num_highest = 5;
-static int min_width = 3;
+static int num_highest = 6;
+static int min_width = 10;
 
 static float smoothed_max_mag = 1e-6f; // initialize to small positive number
 
@@ -83,20 +98,21 @@ static void convert_to_mono() {
     int32_t right = (int32_t)samples_copy[i * 2 + 1];
     float left_f = left / 2147483648.0f;
     float right_f = right / 2147483648.0f;
-    fft_mono[i] = (left_f + right_f) * 0.5f;
+    fft_real[i] = (left_f + right_f) * 0.5f;
+    fft_img[i] = 0;
   }
 }
 
 static bool send_peaks(peak_t *magnitudes, int length) {
-    if (max_magnitude_queue == NULL) return false;
+    if (peaks_queue == NULL) return false;
     
     TickType_t timeout_ticks = 0;
     
     // Allocate message struct and values buffer
-    peak_msg_t *msg = malloc(sizeof(peak_msg_t));
+    peak_msg_t *msg = (peak_msg_t *)malloc(sizeof(peak_msg_t));
     if (!msg) return false;
     msg->length = length;
-    msg->values = malloc(length * sizeof(float));
+    msg->values = (float *)malloc(length * sizeof(float));
     if (!msg->values) {
         free(msg);
         return false;
@@ -106,7 +122,7 @@ static bool send_peaks(peak_t *magnitudes, int length) {
     memcpy(msg->values, magnitudes, length * sizeof(float));
 
     // Send pointer to queue
-    if (xQueueSend(max_magnitude_queue, &msg, timeout_ticks) != pdTRUE) {
+    if (xQueueSend(peaks_queue, &msg, timeout_ticks) != pdTRUE) {
         free(msg->values);
         free(msg);
         return false;
@@ -117,21 +133,17 @@ static bool send_peaks(peak_t *magnitudes, int length) {
 
 static void fft_task(void *param) {
   while (true) {
-    if (read_all_samples(samples_copy, sizeof(samples_copy) / sizeof(samples_copy[0]))) {
+    if (READ_SAMPLES(samples_copy, sizeof(samples_copy) / sizeof(samples_copy[0]))) {
       convert_to_mono();
 
-      for (int i = 0; i < SAMPLES; i++) {
-        fft_input[i] = fft_mono[i];
-      }
-
-      dsp_cplx_fwd(fft_handle, fft_input, fft_output);
+      FFT.windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+      FFT.compute(FFT_FORWARD);
+      FFT.complexToMagnitude();
 
       peak_t peaks[MAX_BIN];
       for (int i = 0; i < MAX_BIN; i++) {
-        float re = fft_output[2 * i];
-        float im = fft_output[2 * i + 1];
         peaks[i].index = i;
-        peaks[i].magnitude = sqrtf(re * re + im * im);
+        peaks[i].magnitude = fft_real[i];
       }
 
       qsort(peaks, MAX_BIN, sizeof(peak_t), cmp_peak);
@@ -146,8 +158,8 @@ static void fft_task(void *param) {
         xSemaphoreGive(config_mutex);
       } else {
         // fallback to defaults if mutex not available
-        current_num_highest = 5;
-        current_min_width = 3;
+        current_num_highest = 6;
+        current_min_width = 10;
       }
 
       peak_t selected[current_num_highest];
@@ -179,8 +191,8 @@ static void fft_task(void *param) {
   }
 }
 
-void fft_task_init(QueueHandle_t queue_handle, int initial_num_highest, int initial_min_width) {
-  peaks_queue = xQueueCreate(MAX_LED_QUEUE, sizeof(max_magnitude_msg_t *));
+void fft_task_init() {
+  peaks_queue = xQueueCreate(MAX_LED_QUEUE, sizeof(peak_msg_t *));
 
   config_mutex = xSemaphoreCreateMutex();
   if (!config_mutex) {
@@ -190,16 +202,9 @@ void fft_task_init(QueueHandle_t queue_handle, int initial_num_highest, int init
 
   // Initialize config values safely
   if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100))) {
-    num_highest = initial_num_highest;
-    min_width = initial_min_width;
+    num_highest = 6;
+    min_width = 10;
     xSemaphoreGive(config_mutex);
-  }
-
-  dsp_init();
-  fft_handle = dsp_fft_init(fft_handle, SAMPLES);
-  if (!fft_handle) {
-    Serial.println("FFT init failed");
-    return;
   }
 
   xTaskCreate(fft_task, "fft_task", 4096, NULL, 5, NULL);

@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Send JSON</title>
+</head>
+<body>
+  <h2>Send JSON via WebSocket</h2>
+  <form id="jsonForm">
+    <label>ID: <input name="id" type="number" required></label><br>
+    <label>Band: <input name="band" type="number" min="1" max="6" required></label><br>
+    <label>Lock (true/false): <input name="lock" required></label><br>
+    <label>Flash (true/false): <input name="flash" required></label><br>
+    <label>Battery %: <input name="battery" type="number" min="0" max="100" required></label><br>
+    <label>Red (0-255): <input name="red" type="number" min="0" max="255" required></label><br>
+    <label>Green (0-255): <input name="green" type="number" min="0" max="255" required></label><br>
+    <label>Blue (0-255): <input name="blue" type="number" min="0" max="255" required></label><br><br>
+    <button type="submit">Send</button>
+  </form>
+
+  <script>
+    let ws;
+    let reconnectInterval = 1000;
+
+    function connectWebSocket() {
+      ws = new WebSocket('ws://192.168.0.123/ws');
+
+      ws.onopen = () => {
+        console.log('WebSocket connected');
+      };
+
+      ws.onclose = (e) => {
+        console.warn('WebSocket closed. Reconnecting in 1s...', e.reason);
+        setTimeout(connectWebSocket, reconnectInterval);
+      };
+
+      ws.onerror = (err) => {
+        console.error('WebSocket error', err);
+        ws.close(); // Trigger reconnect via onclose
+      };
+
+      ws.onmessage = (event) => {
+        console.log('Message from server:', event.data);
+      };
+    }
+
+    connectWebSocket();
+
+    document.getElementById('jsonForm').onsubmit = (e) => {
+      e.preventDefault();
+      const form = e.target;
+      const data = {
+        id: parseInt(form.id.value),
+        band: parseInt(form.band.value),
+        lock: form.lock.value === "true",
+        flash: form.flash.value === "true",
+        battery: parseInt(form.battery.value),
+        red: parseInt(form.red.value),
+        green: parseInt(form.green.value),
+        blue: parseInt(form.blue.value)
+      };
+      if (ws.readyState === WebSocket.OPEN) {
+        console.log(JSON.stringify(data))
+        ws.send(JSON.stringify(data));
+      } else {
+        alert('WebSocket not connected. Please wait...');
+      }
+    };
+  </script>
+</body>
+</html>

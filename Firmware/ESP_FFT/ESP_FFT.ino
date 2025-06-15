@@ -9,7 +9,7 @@ void setup() {
 
   //TODO toggle debugging and use serial
 
-  i2s_init();
+  // i2s_init();
   initFS();
 
   wifi_init();
