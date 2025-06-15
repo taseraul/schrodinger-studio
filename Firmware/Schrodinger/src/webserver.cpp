@@ -8,6 +8,9 @@
 #include "esp_log.h"
 #include "Arduino_JSON.h"
 #include "now.hpp"
+#include "esp_heap_caps.h"
+#include "bt_monitor.hpp"
+#include "memory_manager.hpp"
 
 // Wi-Fi credentials
 const char *ssid = "Raul";
@@ -136,15 +139,88 @@ void notifyClients(String json) {
 
 // Initialize web server
 void webserver_init() {
+  Serial.println("Initializing Web Server...");
+  
+  // Print memory before webserver init
+  Serial.printf("Free heap before webserver init: %d bytes\n", ESP.getFreeHeap());
+  Serial.printf("Free PSRAM before webserver init: %d bytes\n", ESP.getFreePsram());
+  
   initWebSocket();
 
+  // Add memory status endpoint for debugging
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    // Use minimal memory for status response
+    char json[256];
+    snprintf(json, sizeof(json), 
+      "{\"heap\":%d,\"psram\":%d,\"wifi_connected\":%s,\"wifi_rssi\":%d,\"bt_state\":%d,\"bt_audio_active\":%s,\"uptime\":%lu}",
+      ESP.getFreeHeap(), ESP.getFreePsram(),
+      WiFi.status() == WL_CONNECTED ? "true" : "false",
+      WiFi.RSSI(), get_bt_state(),
+      is_bt_audio_active() ? "true" : "false",
+      millis()
+    );
+    request->send(200, "application/json", json);
+  });
+
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    // request->send(200, "text/html", index_html);
+    // Check memory health before serving files
+    if (!check_memory_health()) {
+      ESP_LOGW(TAG, "Memory health check failed before serving file");
+      
+      // Try to recover memory
+      force_garbage_collection();
+      
+      // Check again after cleanup
+      if (!check_memory_health()) {
+        char errorMsg[128];
+        snprintf(errorMsg, sizeof(errorMsg), 
+          "Service temporarily unavailable - insufficient memory (%d bytes free)", 
+          ESP.getFreeHeap());
+        request->send(503, "text/plain", errorMsg);
+        return;
+      }
+    }
+    
+    // Additional check for largest free block to ensure we can handle the file
+    size_t largestBlock = get_largest_free_block();
+    if (largestBlock < 8192) {  // Need at least 8KB contiguous for file serving
+      ESP_LOGW(TAG, "Insufficient contiguous memory: %d bytes largest block", largestBlock);
+      force_garbage_collection();
+      
+      largestBlock = get_largest_free_block();
+      if (largestBlock < 8192) {
+        request->send(503, "text/plain", "Service temporarily unavailable - memory fragmentation");
+        return;
+      }
+    }
+    
+    // Log memory usage for debugging
+    ESP_LOGI(TAG, "Serving main page with %d bytes heap free, %d largest block", 
+             ESP.getFreeHeap(), largestBlock);
     request->send(SPIFFS,"/client.html" ,"text/html");
   });
 
-  // server.serveStatic("/", SPIFFS, "/");
-  AsyncOTA.begin(&server); // Start ElegantOTA
+  // Add lightweight memory info endpoint
+  server.on("/mem", HTTP_GET, [](AsyncWebServerRequest *request) {
+    char response[64];
+    snprintf(response, sizeof(response), "Heap: %d, PSRAM: %d", 
+             ESP.getFreeHeap(), ESP.getFreePsram());
+    request->send(200, "text/plain", response);
+  });
+
+  // Add error handler for better debugging
+  server.onNotFound([](AsyncWebServerRequest *request) {
+    ESP_LOGW(TAG, "404 - File not found: %s", request->url().c_str());
+    request->send(404, "text/plain", "File not found");
+  });
+
+  // Disable OTA temporarily to save memory - can be re-enabled later if needed
+  // AsyncOTA.begin(&server); // Start ElegantOTA
 
   server.begin();
+  
+  // Print memory after webserver init
+  Serial.printf("Free heap after webserver init: %d bytes\n", ESP.getFreeHeap());
+  Serial.printf("Free PSRAM after webserver init: %d bytes\n", ESP.getFreePsram());
+  Serial.println("Web Server initialized successfully");
 }

@@ -5,6 +5,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "bt_monitor.hpp"
+#include "esp_log.h"
+
+static const char* TAG = "bt";
 
 NumberFormatConverterStream scaledBt;
 BluetoothA2DPSink a2dp_sink(scaledBt);
@@ -23,6 +27,10 @@ static volatile bool buffer_ready = false;
 void receiveBtSamples(const uint8_t* data, uint32_t length) 
 {
   ESP_LOGI("bt","Samples read %d",length);
+  
+  // Update BT state to indicate audio is playing
+  bt_state_changed(BT_AUDIO_PLAYING);
+  
   // if (xSemaphoreTake(buffer_mutex, 0)) {
     memcpy(samples,data,length);      
     buffer_ready = true;
@@ -65,44 +73,115 @@ bool readBtSamples(uint32_t* dest, size_t length){
 // }
 
 void bt_init() {
-
-  // i2s_pin_config_t my_pin_config = {
-  //     .bck_io_num   = 14,
-  //     .ws_io_num    = 15,
-  //     .data_out_num = 32,
-  //     .data_in_num  = I2S_PIN_NO_CHANGE};
-
-  // static i2s_config_t i2s_config = {
-  //     .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-  //     .sample_rate          = 44100,     // updated automatically by A2DP
-  //     .bits_per_sample      = (i2s_bits_per_sample_t)32,
-  //     .channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT,
-  //     .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_STAND_I2S),
-  //     .intr_alloc_flags     = 0,     // default interrupt priority
-  //     .dma_buf_count        = 8,
-  //     .dma_buf_len          = 64,
-  //     .use_apll             = true,
-  //     .tx_desc_auto_clear   = true     // avoiding noise in case of data unavailability
-  // };
-  // a2dp_sink.set_i2s_config(i2s_config);
-  // a2dp_sink.set_pin_config(my_pin_config);
+  ESP_LOGI(TAG, "Initializing Bluetooth A2DP Sink...");
+  
+  // Print memory before BT init
+  uint32_t heapBefore = ESP.getFreeHeap();
+  ESP_LOGI(TAG, "Free heap before BT init: %d bytes", heapBefore);
+  
+  // Check if we have enough memory to initialize Bluetooth
+  if (heapBefore < 80000) {
+    ESP_LOGW(TAG, "Low memory before BT init (%d bytes). BT may fail.", heapBefore);
+  }
+  
+  // CRITICAL: Temporarily disable WiFi to avoid coexistence conflicts during BT init
+  ESP_LOGI(TAG, "Temporarily disabling WiFi for BT initialization...");
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(500);  // Allow WiFi to fully shut down
+  
+  // Create buffer mutex with error checking
   buffer_mutex = xSemaphoreCreateMutex();
   if (!buffer_mutex) {
-    Serial.println("Buffer mutex creation failed");
+    ESP_LOGE(TAG, "Buffer mutex creation failed");
     return;
   }
-  a2dp_sink.set_stream_reader(receiveBtSamples,false);
+  
+  // Configure I2S settings BEFORE starting A2DP to prevent conflicts
+  // Use different pins than the existing I2S RX configuration
+  i2s_pin_config_t my_pin_config = {
+      .bck_io_num   = 26,  // Changed from 14 to avoid conflict
+      .ws_io_num    = 25,  // Changed from 15 to avoid conflict  
+      .data_out_num = 32,
+      .data_in_num  = I2S_PIN_NO_CHANGE
+  };
 
-  // scaledBt.begin(16,32);
-  a2dp_sink.start("Schrodinger2");
+  i2s_config_t i2s_config = {
+      .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+      .sample_rate          = 44100,
+      .bits_per_sample      = (i2s_bits_per_sample_t)16,  // Changed from 32 to 16 to save memory
+      .channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT,
+      .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_STAND_I2S),
+      .intr_alloc_flags     = 0,
+      .dma_buf_count        = 4,  // Further reduced to save memory
+      .dma_buf_len          = 32, // Further reduced to save memory
+      .use_apll             = false,  // Disabled to save memory
+      .tx_desc_auto_clear   = true
+  };
+  
+  // Set I2S configuration before starting A2DP
+  a2dp_sink.set_i2s_config(i2s_config);
+  a2dp_sink.set_pin_config(my_pin_config);
+  
+  // Set up the stream reader callback
+  a2dp_sink.set_stream_reader(receiveBtSamples, false);
+  
+  // Configure A2DP with optimized settings for memory usage
+  a2dp_sink.set_auto_reconnect(false); // Disable auto-reconnect to save resources
+  
+  ESP_LOGI(TAG, "Starting A2DP sink with name: Schrodinger2");
+  
+  // Monitor memory during BT start
+  uint32_t heapDuringStart = ESP.getFreeHeap();
+  ESP_LOGI(TAG, "Heap during BT start: %d bytes", heapDuringStart);
+  
+  // Start the A2DP sink with error handling
+  try {
+    a2dp_sink.start("Schrodinger2");
+    ESP_LOGI(TAG, "A2DP sink started successfully");
+  } catch (const std::exception& e) {
+    ESP_LOGE(TAG, "A2DP sink start failed: %s", e.what());
+    return;
+  } catch (...) {
+    ESP_LOGE(TAG, "A2DP sink start failed with unknown exception");
+    return;
+  }
+  
+  // Print memory after BT init
+  uint32_t heapAfter = ESP.getFreeHeap();
+  ESP_LOGI(TAG, "Free heap after BT init: %d bytes", heapAfter);
+  ESP_LOGI(TAG, "BT initialization consumed: %d bytes", heapBefore - heapAfter);
+  
+  if (heapAfter < 30000) {
+    ESP_LOGW(TAG, "Very low memory after BT init. System may be unstable.");
+  }
+  
+  // Re-enable WiFi after successful BT initialization
+  ESP_LOGI(TAG, "Re-enabling WiFi after BT initialization...");
+  WiFi.mode(WIFI_AP_STA);
+  delay(500);  // Allow WiFi to initialize
+  
+  ESP_LOGI(TAG, "Bluetooth A2DP Sink initialized successfully");
+}
 
-  // xTaskCreatePinnedToCore(
-  //   bt_task,
-  //   "BT Read Task",
-  //   BT_TASK_STACK_SIZE,
-  //   NULL,
-  //   BT_TASK_PRIORITY,
-  //   NULL,
-  //   0  // Pin to Core 0
-  // );
+// Function to re-initialize WiFi connection after BT is started
+void bt_post_init_wifi_restore() {
+  ESP_LOGI(TAG, "Restoring WiFi connection after BT initialization...");
+  
+  // Re-establish WiFi connection
+  WiFi.begin("Raul", "armaghedon");
+  
+  // Wait for connection with timeout
+  int retryCount = 10;
+  while (WiFi.status() != WL_CONNECTED && retryCount--) {
+    delay(1000);
+    ESP_LOGI(TAG, "Reconnecting to WiFi... (%d attempts left)", retryCount);
+  }
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    ESP_LOGW(TAG, "Failed to reconnect to WiFi, starting AP mode");
+    WiFi.softAP("Schrodinger");
+  } else {
+    ESP_LOGI(TAG, "WiFi reconnected successfully");
+  }
 }
