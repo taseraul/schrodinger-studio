@@ -7,6 +7,7 @@
 #include "freertos/semphr.h"
 #include "bt_monitor.hpp"
 #include "esp_log.h"
+#include "circular_buffer.hpp"
 
 static const char* TAG = "bt";
 
@@ -16,39 +17,77 @@ BluetoothA2DPSink a2dp_sink(scaledBt);
 #define BT_TASK_STACK_SIZE 8192
 #define BT_TASK_PRIORITY   10
 
-static uint32_t samples[SAMPLES * 2];   // For writing from I2S
+// Circular buffer for BT samples (16KB in PSRAM)
+static CircularBuffer* bt_circular_buffer = nullptr;
 
-// Mutex for protecting buffers
-static SemaphoreHandle_t buffer_mutex;
-
-// Flag to indicate new data is ready
-static volatile bool buffer_ready = false;
+// Debug counters
+static uint32_t total_samples_received = 0;
+static uint32_t buffer_overflow_count = 0;
 
 void receiveBtSamples(const uint8_t* data, uint32_t length) 
 {
-  ESP_LOGI("bt","Samples read %d",length);
+  static uint32_t callback_count = 0;
+  callback_count++;
+  
+  if (!bt_circular_buffer || !data || length == 0) {
+    ESP_LOGW(TAG, "BT callback %d: Invalid params - buffer:%p data:%p length:%d", 
+             callback_count, bt_circular_buffer, data, length);
+    return;
+  }
+  
+  // Log first few callbacks and then periodically
+  if (callback_count <= 5 || callback_count % 100 == 0) {
+    ESP_LOGI(TAG, "BT callback %d: Received %d bytes", callback_count, length);
+  }
   
   // Update BT state to indicate audio is playing
   bt_state_changed(BT_AUDIO_PLAYING);
   
-  // if (xSemaphoreTake(buffer_mutex, 0)) {
-    memcpy(samples,data,length);      
-    buffer_ready = true;
-  //   xSemaphoreGive(buffer_mutex);
-  // }
+  // Write samples to circular buffer (converts 16-bit to 32-bit internally)
+  if (bt_circular_buffer->write_samples_16bit(data, length)) {
+    total_samples_received += length / 4;  // Count sample pairs
+    
+    // Log periodically for debugging (every 1000 sample pairs)
+    if (total_samples_received % 1000 == 0) {
+      ESP_LOGI(TAG, "BT samples: %d pairs, buffer: %.1f%%, available: %d pairs", 
+               total_samples_received, bt_circular_buffer->get_utilization(),
+               bt_circular_buffer->get_sample_count());
+    }
+  } else {
+    buffer_overflow_count++;
+    ESP_LOGW(TAG, "BT buffer write failed %d times", buffer_overflow_count);
+  }
 }
 
-bool readBtSamples(uint32_t* dest, size_t length){
-  if (length < SAMPLES * 2) return false;
-
-  bool copied = false;
-  if (buffer_ready && xSemaphoreTake(buffer_mutex, 0)) {
-    memcpy(dest, samples, sizeof(samples));
-    buffer_ready = false;
-    xSemaphoreGive(buffer_mutex);
-    copied = true;
+bool readBtSamples(uint32_t* dest, size_t length) {
+  static uint32_t read_attempts = 0;
+  read_attempts++;
+  
+  if (!bt_circular_buffer || !dest || length < SAMPLES * 2) {
+    ESP_LOGW(TAG, "Read attempt %d: Invalid params - buffer:%p dest:%p length:%d", 
+             read_attempts, bt_circular_buffer, dest, length);
+    return false;
   }
-  return copied;
+
+  size_t available_samples = bt_circular_buffer->get_sample_count();
+  
+  // Log first few attempts and then periodically
+  if (read_attempts <= 10 || read_attempts % 100 == 0) {
+    ESP_LOGI(TAG, "Read attempt %d: Available samples: %d, need: %d", 
+             read_attempts, available_samples, SAMPLES);
+  }
+
+  // Read exactly SAMPLES sample pairs from circular buffer
+  bool success = bt_circular_buffer->read_samples_32bit(dest, SAMPLES);
+  
+  if (success && (read_attempts <= 10 || read_attempts % 100 == 0)) {
+    ESP_LOGI(TAG, "Read attempt %d: SUCCESS - Read %d sample pairs", read_attempts, SAMPLES);
+  } else if (!success && read_attempts % 50 == 0) {
+    ESP_LOGW(TAG, "Read attempt %d: FAILED - Not enough samples (have: %d, need: %d)", 
+             read_attempts, available_samples, SAMPLES);
+  }
+  
+  return success;
 }
 
 // // High-priority task: reads samples from BT
@@ -90,12 +129,17 @@ void bt_init() {
   WiFi.mode(WIFI_OFF);
   delay(500);  // Allow WiFi to fully shut down
   
-  // Create buffer mutex with error checking
-  buffer_mutex = xSemaphoreCreateMutex();
-  if (!buffer_mutex) {
-    ESP_LOGE(TAG, "Buffer mutex creation failed");
+  // Initialize circular buffer for BT samples (16KB in PSRAM)
+  bt_circular_buffer = new CircularBuffer(16384);  // 16KB
+  if (!bt_circular_buffer || !bt_circular_buffer->init()) {
+    ESP_LOGE(TAG, "Failed to initialize BT circular buffer");
+    if (bt_circular_buffer) {
+      delete bt_circular_buffer;
+      bt_circular_buffer = nullptr;
+    }
     return;
   }
+  ESP_LOGI(TAG, "BT circular buffer initialized successfully");
   
   // Configure I2S settings BEFORE starting A2DP to prevent conflicts
   // Use different pins than the existing I2S RX configuration
@@ -162,6 +206,27 @@ void bt_init() {
   delay(500);  // Allow WiFi to initialize
   
   ESP_LOGI(TAG, "Bluetooth A2DP Sink initialized successfully");
+}
+
+void bt_deinit() {
+  ESP_LOGI(TAG, "Deinitializing Bluetooth A2DP Sink...");
+  
+  // Stop A2DP sink
+  a2dp_sink.end();
+  
+  // Clean up circular buffer
+  if (bt_circular_buffer) {
+    bt_circular_buffer->deinit();
+    delete bt_circular_buffer;
+    bt_circular_buffer = nullptr;
+    ESP_LOGI(TAG, "BT circular buffer cleaned up");
+  }
+  
+  // Reset counters
+  total_samples_received = 0;
+  buffer_overflow_count = 0;
+  
+  ESP_LOGI(TAG, "Bluetooth A2DP Sink deinitialized");
 }
 
 // Function to re-initialize WiFi connection after BT is started

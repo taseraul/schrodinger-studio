@@ -132,8 +132,14 @@ static bool send_peaks(peak_t *magnitudes, int length) {
 }
 
 static void fft_task(void *param) {
+  ESP_LOGI("fft", "FFT task started");
+  uint32_t loop_count = 0;
+  
   while (true) {
+    loop_count++;
+    
     if (READ_SAMPLES(samples_copy, sizeof(samples_copy) / sizeof(samples_copy[0]))) {
+      ESP_LOGI("fft", "Loop %d: Samples read successfully, processing FFT", loop_count);
       convert_to_mono();
 
       FFT.windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
@@ -184,7 +190,31 @@ static void fft_task(void *param) {
       normalize_magnitudes(selected,current_num_highest);
       sort_peaks_by_index(selected,current_num_highest);
 
+      // Log FFT peaks with frequencies and magnitudes
+      if (count > 0) {
+        char log_buffer[256];
+        int pos = 0;
+        pos += snprintf(log_buffer + pos, sizeof(log_buffer) - pos, "FFT Peaks: ");
+        
+        for (int i = 0; i < count; i++) {
+          // Convert bin index to frequency: freq = (bin * SAMPLE_RATE) / SAMPLES
+          float frequency = (float)(selected[i].index * SAMPLE_RATE) / SAMPLES;
+          pos += snprintf(log_buffer + pos, sizeof(log_buffer) - pos, 
+                         "[%.0fHz: %.2f] ", frequency, selected[i].magnitude);
+          
+          // Prevent buffer overflow
+          if (pos >= sizeof(log_buffer) - 20) break;
+        }
+        
+        ESP_LOGI("fft", "%s", log_buffer);
+      }
+
       send_peaks(selected,current_num_highest);
+    } else {
+      // Log periodically when no samples are available
+      if (loop_count % 1000 == 0) {
+        ESP_LOGW("fft", "Loop %d: No samples available for FFT processing", loop_count);
+      }
     }
 
     vTaskDelay(pdMS_TO_TICKS(16));

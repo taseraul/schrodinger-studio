@@ -77,8 +77,9 @@ void setup() {
     
     // IMPORTANT: Do NOT initialize I2S separately when using Bluetooth A2DP
     // The A2DP library handles its own I2S initialization on different pins
-    // Uncomment these only if you want to use I2S input without Bluetooth:
-    // fft_task_init();
+    // Initialize FFT task to process Bluetooth audio samples
+    fft_task_init();
+    ESP_LOGI(TAG, "After FFT init - Heap: %d bytes", ESP.getFreeHeap());
     // i2s_init();  // This conflicts with A2DP I2S initialization
     
     ESP_LOGI(TAG, "System initialization completed successfully");
