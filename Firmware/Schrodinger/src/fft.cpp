@@ -10,6 +10,9 @@
 #include "bt.hpp"
 #include "Arduino.h"
 #include "arduinoFFT.h"
+#include "now.hpp"
+#include "webserver.hpp"
+#include "Arduino_JSON.h"
 
 // #define READ_SAMPLES read_all_samples
 #define READ_SAMPLES readBtSamples
@@ -34,13 +37,18 @@ typedef struct {
     float *values;   // Dynamically allocated array of magnitudes
 } peak_msg_t;
 
-static uint32_t samples_copy[SAMPLES * 2];
-static float fft_real[SAMPLES];
-static float fft_img[SAMPLES];
+// Use PSRAM for large buffers to avoid heap fragmentation
+static uint32_t* samples_copy = nullptr;
+static float* fft_real = nullptr;
+static float* fft_img = nullptr;
+static peak_t* peaks_buffer = nullptr;
 
 static QueueHandle_t peaks_queue = NULL;
+static ArduinoFFT<float>* FFT = nullptr;
 
-ArduinoFFT<float> FFT = ArduinoFFT<float>(fft_real, fft_img, SAMPLES, SAMPLE_RATE);
+// Pre-allocated buffers for ESP-NOW and WebSocket data
+static struct_frequency_data freq_data_buffer;
+static float spectrum_bands[MAX_BIN];  // All frequency bands for webpage
 
 static SemaphoreHandle_t config_mutex = NULL;
 static int num_highest = 6;
@@ -103,6 +111,41 @@ static void convert_to_mono() {
   }
 }
 
+static void send_frequency_data_espnow(peak_t *selected, int count) {
+    // Use pre-allocated buffer
+    freq_data_buffer.preamble = PREAMBLE;
+    freq_data_buffer.msgType = DATA_PACKET;
+    freq_data_buffer.size = 6;
+    
+    // Initialize all bands to 0
+    memset(freq_data_buffer.bands, 0, 6);
+    
+    // Map selected peaks to frequency bands (0-5)
+    for (int i = 0; i < count && i < 6; i++) {
+        if (selected[i].magnitude > 0) {
+            freq_data_buffer.bands[i] = (uint8_t)(selected[i].magnitude * 255.0f);
+        }
+    }
+    
+    // Send via ESP-NOW
+    now_send_frequency_data(&freq_data_buffer);
+}
+
+static void send_frequency_data_websocket_all_bands() {
+    JSONVar spectrum;
+    spectrum["type"] = "spectrum";
+    
+    // Create array of ALL frequency bands, not just selected peaks
+    JSONVar bands;
+    for (int i = 0; i < MAX_BIN; i++) {
+        bands[i] = spectrum_bands[i];
+    }
+    spectrum["bands"] = bands;
+    
+    // Send to all WebSocket clients
+    notifyClients(JSON.stringify(spectrum));
+}
+
 static bool send_peaks(peak_t *magnitudes, int length) {
     if (peaks_queue == NULL) return false;
     
@@ -133,20 +176,26 @@ static bool send_peaks(peak_t *magnitudes, int length) {
 
 static void fft_task(void *param) {
   while (true) {
-    if (READ_SAMPLES(samples_copy, sizeof(samples_copy) / sizeof(samples_copy[0]))) {
+    if (READ_SAMPLES(samples_copy, SAMPLES * 2)) {
       convert_to_mono();
 
-      FFT.windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
-      FFT.compute(FFT_FORWARD);
-      FFT.complexToMagnitude();
+      // Use pointer syntax for FFT operations
+      FFT->windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+      FFT->compute(FFT_FORWARD);
+      FFT->complexToMagnitude();
 
-      peak_t peaks[MAX_BIN];
+      // Initialize spectrum_bands array to 0 (all bands)
+      memset(spectrum_bands, 0, MAX_BIN * sizeof(float));
+
+      // Copy FFT results to spectrum_bands and peaks_buffer
       for (int i = 0; i < MAX_BIN; i++) {
-        peaks[i].index = i;
-        peaks[i].magnitude = fft_real[i];
+        peaks_buffer[i].index = i;
+        peaks_buffer[i].magnitude = fft_real[i];
+        spectrum_bands[i] = fft_real[i];  // Store all bands for webpage
       }
 
-      qsort(peaks, MAX_BIN, sizeof(peak_t), cmp_peak);
+      // Sort peaks by magnitude for peak selection
+      qsort(peaks_buffer, MAX_BIN, sizeof(peak_t), cmp_peak);
 
       int current_num_highest;
       int current_min_width;
@@ -162,13 +211,14 @@ static void fft_task(void *param) {
         current_min_width = 10;
       }
 
-      peak_t selected[current_num_highest];
+      // Use static array to avoid stack allocation
+      static peak_t selected[6];  // Max 6 peaks
       int count = 0;
 
-      memset(selected,0, sizeof(selected));
+      memset(selected, 0, sizeof(selected));
 
       for (int i = 0; i < MAX_BIN && count < current_num_highest; i++) {
-        int candidate = peaks[i].index;
+        int candidate = peaks_buffer[i].index;
         bool too_close = false;
         for (int j = 0; j < count; j++) {
           if (abs(selected[j].index - candidate) < current_min_width) {
@@ -177,14 +227,28 @@ static void fft_task(void *param) {
           }
         }
         if (!too_close) {
-          selected[count++] = peaks[i];
+          selected[count++] = peaks_buffer[i];
         }
       }
 
-      normalize_magnitudes(selected,current_num_highest);
-      sort_peaks_by_index(selected,current_num_highest);
+      normalize_magnitudes(selected, current_num_highest);
+      sort_peaks_by_index(selected, current_num_highest);
 
-      send_peaks(selected,current_num_highest);
+      // Zero out spectrum_bands except for selected peaks
+      memset(spectrum_bands, 0, MAX_BIN * sizeof(float));
+      for (int i = 0; i < count; i++) {
+        if (selected[i].index < MAX_BIN) {
+          spectrum_bands[selected[i].index] = selected[i].magnitude;
+        }
+      }
+
+      // Send frequency data via ESP-NOW to Mood devices
+      send_frequency_data_espnow(selected, count);
+      
+      // Send ALL frequency bands via WebSocket to web interface
+      send_frequency_data_websocket_all_bands();
+
+      send_peaks(selected, current_num_highest);
     }
 
     vTaskDelay(pdMS_TO_TICKS(16));
@@ -192,11 +256,61 @@ static void fft_task(void *param) {
 }
 
 void fft_task_init() {
+  ESP_LOGI("fft", "Initializing FFT task with PSRAM buffers");
+  
+  // Allocate large buffers in PSRAM
+  samples_copy = (uint32_t*)heap_caps_malloc(SAMPLES * 2 * sizeof(uint32_t), MALLOC_CAP_SPIRAM);
+  if (!samples_copy) {
+    ESP_LOGE("fft", "Failed to allocate samples_copy in PSRAM");
+    return;
+  }
+  
+  fft_real = (float*)heap_caps_malloc(SAMPLES * sizeof(float), MALLOC_CAP_SPIRAM);
+  if (!fft_real) {
+    ESP_LOGE("fft", "Failed to allocate fft_real in PSRAM");
+    heap_caps_free(samples_copy);
+    return;
+  }
+  
+  fft_img = (float*)heap_caps_malloc(SAMPLES * sizeof(float), MALLOC_CAP_SPIRAM);
+  if (!fft_img) {
+    ESP_LOGE("fft", "Failed to allocate fft_img in PSRAM");
+    heap_caps_free(samples_copy);
+    heap_caps_free(fft_real);
+    return;
+  }
+  
+  peaks_buffer = (peak_t*)heap_caps_malloc(MAX_BIN * sizeof(peak_t), MALLOC_CAP_SPIRAM);
+  if (!peaks_buffer) {
+    ESP_LOGE("fft", "Failed to allocate peaks_buffer in PSRAM");
+    heap_caps_free(samples_copy);
+    heap_caps_free(fft_real);
+    heap_caps_free(fft_img);
+    return;
+  }
+  
+  // Create FFT instance
+  FFT = new ArduinoFFT<float>(fft_real, fft_img, SAMPLES, SAMPLE_RATE);
+  if (!FFT) {
+    ESP_LOGE("fft", "Failed to create FFT instance");
+    heap_caps_free(samples_copy);
+    heap_caps_free(fft_real);
+    heap_caps_free(fft_img);
+    heap_caps_free(peaks_buffer);
+    return;
+  }
+  
+  ESP_LOGI("fft", "PSRAM buffers allocated successfully");
+  ESP_LOGI("fft", "samples_copy: %d bytes", SAMPLES * 2 * sizeof(uint32_t));
+  ESP_LOGI("fft", "fft_real: %d bytes", SAMPLES * sizeof(float));
+  ESP_LOGI("fft", "fft_img: %d bytes", SAMPLES * sizeof(float));
+  ESP_LOGI("fft", "peaks_buffer: %d bytes", MAX_BIN * sizeof(peak_t));
+  
   peaks_queue = xQueueCreate(MAX_LED_QUEUE, sizeof(peak_msg_t *));
 
   config_mutex = xSemaphoreCreateMutex();
   if (!config_mutex) {
-    Serial.println("Config mutex creation failed");
+    ESP_LOGE("fft", "Config mutex creation failed");
     return;
   }
 
@@ -207,7 +321,9 @@ void fft_task_init() {
     xSemaphoreGive(config_mutex);
   }
 
-  xTaskCreate(fft_task, "fft_task", 4096, NULL, 5, NULL);
+  // Increase stack size to 12KB to handle larger operations
+  xTaskCreate(fft_task, "fft_task", 12288, NULL, 5, NULL);
+  ESP_LOGI("fft", "FFT task created with 12KB stack");
 }
 
 // Thread-safe setters/getters

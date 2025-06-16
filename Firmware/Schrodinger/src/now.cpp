@@ -264,6 +264,15 @@ void OnDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
   }
 }
 
+void now_send_frequency_data(const struct_frequency_data* freq_data) {
+  if (!freq_data) return;
+  
+  esp_err_t result = esp_now_send(broadcastAddr, (uint8_t*)freq_data, sizeof(struct_frequency_data));
+  if (result != ESP_OK) {
+    ESP_LOGW("now", "Failed to send frequency data: %d", result);
+  }
+}
+
 void now_init() {
   // Init ESP-NOW
   if (esp_now_init() != ESP_OK) {

@@ -31,6 +31,13 @@ typedef struct struct_update {
   uint8_t updateData;
 } struct_update;
 
+typedef struct struct_frequency_data {
+  uint8_t preamble;
+  uint8_t msgType;
+  uint8_t size;
+  uint8_t bands[6];  // Frequency band magnitudes (0-255)
+} struct_frequency_data;
+
 typedef struct device_handler {
   uint8_t macAddr[6];
   uint8_t band;

@@ -33,6 +33,7 @@
 
 void now_init();
 void now_send_light(const struct_message* message);
+void now_send_frequency_data(const struct_frequency_data* freq_data);
 void setFlash(uint8_t flash, uint8_t index);
 void setBand(uint8_t band, uint8_t index);
 void setColor(const uint8_t* color, uint8_t index);

@@ -7,6 +7,7 @@
 #include "freertos/semphr.h"
 #include "bt_monitor.hpp"
 #include "esp_log.h"
+#include "circular_buffer.hpp"
 
 static const char* TAG = "bt";
 
@@ -15,6 +16,9 @@ BluetoothA2DPSink a2dp_sink(scaledBt);
 
 #define BT_TASK_STACK_SIZE 8192
 #define BT_TASK_PRIORITY   10
+
+// Circular buffer for audio samples (4x FFT size for stability)
+static CircularBuffer* audio_buffer = nullptr;
 
 static uint32_t samples[SAMPLES * 2];   // For writing from I2S
 
@@ -26,21 +30,35 @@ static volatile bool buffer_ready = false;
 
 void receiveBtSamples(const uint8_t* data, uint32_t length) 
 {
-  ESP_LOGI("bt","Samples read %d",length);
+  ESP_LOGV("bt","Samples received: %d bytes", length);
   
   // Update BT state to indicate audio is playing
   bt_state_changed(BT_AUDIO_PLAYING);
   
-  // if (xSemaphoreTake(buffer_mutex, 0)) {
-    memcpy(samples,data,length);      
-    buffer_ready = true;
-  //   xSemaphoreGive(buffer_mutex);
-  // }
+  // Write to circular buffer
+  if (audio_buffer) {
+    if (!audio_buffer->write_bt_samples(data, length)) {
+      ESP_LOGW("bt", "Failed to write samples to circular buffer");
+    }
+  } else {
+    // Fallback to old method if buffer not initialized
+    if (xSemaphoreTake(buffer_mutex, 0)) {
+      memcpy(samples, data, length);      
+      buffer_ready = true;
+      xSemaphoreGive(buffer_mutex);
+    }
+  }
 }
 
 bool readBtSamples(uint32_t* dest, size_t length){
   if (length < SAMPLES * 2) return false;
 
+  // Try to read from circular buffer first
+  if (audio_buffer && audio_buffer->has_fft_frame(SAMPLES)) {
+    return audio_buffer->read_fft_samples(dest, SAMPLES);
+  }
+  
+  // Fallback to old method
   bool copied = false;
   if (buffer_ready && xSemaphoreTake(buffer_mutex, 0)) {
     memcpy(dest, samples, sizeof(samples));
@@ -94,6 +112,13 @@ void bt_init() {
   buffer_mutex = xSemaphoreCreateMutex();
   if (!buffer_mutex) {
     ESP_LOGE(TAG, "Buffer mutex creation failed");
+    return;
+  }
+  
+  // Initialize circular buffer (4x FFT size for stability)
+  audio_buffer = new CircularBuffer(SAMPLES * 4);
+  if (!audio_buffer) {
+    ESP_LOGE(TAG, "Failed to create circular buffer");
     return;
   }
   

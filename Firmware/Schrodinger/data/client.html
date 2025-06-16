@@ -68,7 +68,28 @@
 <body>
   <div class="card">
     <div class="list" id="deviceList"></div>
-    <div id="right" style="flex: 1; padding: 2rem;">Right side content</div>
+    <div id="right" style="flex: 1; padding: 2rem; display: flex; flex-direction: column;">
+      <div style="flex: 1;">Right side content</div>
+      <div id="spectrum" style="height: 200px; border-top: 1px solid #ddd; padding-top: 1rem;">
+        <h3 style="margin: 0 0 1rem 0; font-size: 1.2rem;">Frequency Spectrum</h3>
+        <div id="spectrumBars" style="display: flex; align-items: end; height: 150px; gap: 8px; justify-content: center;">
+          <div class="spectrum-bar" data-band="0" style="background: #ff4444; width: 30px; height: 0%; transition: height 0.3s ease, background-color 0.3s ease; border-radius: 4px 4px 0 0;"></div>
+          <div class="spectrum-bar" data-band="1" style="background: #44ff44; width: 30px; height: 0%; transition: height 0.3s ease, background-color 0.3s ease; border-radius: 4px 4px 0 0;"></div>
+          <div class="spectrum-bar" data-band="2" style="background: #4444ff; width: 30px; height: 0%; transition: height 0.3s ease, background-color 0.3s ease; border-radius: 4px 4px 0 0;"></div>
+          <div class="spectrum-bar" data-band="3" style="background: #ff7700; width: 30px; height: 0%; transition: height 0.3s ease, background-color 0.3s ease; border-radius: 4px 4px 0 0;"></div>
+          <div class="spectrum-bar" data-band="4" style="background: #00ddff; width: 30px; height: 0%; transition: height 0.3s ease, background-color 0.3s ease; border-radius: 4px 4px 0 0;"></div>
+          <div class="spectrum-bar" data-band="5" style="background: #9900ff; width: 30px; height: 0%; transition: height 0.3s ease, background-color 0.3s ease; border-radius: 4px 4px 0 0;"></div>
+        </div>
+        <div style="display: flex; justify-content: center; gap: 8px; margin-top: 0.5rem; font-size: 0.8rem; color: #666;">
+          <span style="width: 30px; text-align: center;">1</span>
+          <span style="width: 30px; text-align: center;">2</span>
+          <span style="width: 30px; text-align: center;">3</span>
+          <span style="width: 30px; text-align: center;">4</span>
+          <span style="width: 30px; text-align: center;">5</span>
+          <span style="width: 30px; text-align: center;">6</span>
+        </div>
+      </div>
+    </div>
   </div>
 
   <input type="color" id="colorPicker" style="position: absolute; visibility: hidden;">
@@ -83,6 +104,14 @@
 
     socket.onmessage = (event) => {
       const data = JSON.parse(event.data);
+      
+      // Handle spectrum data
+      if (data.type === 'spectrum' && data.bands) {
+        updateSpectrum(data.bands);
+        return;
+      }
+      
+      // Handle device data
       const { id } = data;
       let existing = document.getElementById(`device-${id}`);
 
@@ -121,6 +150,47 @@
         existing.querySelector(".color-box").style.backgroundColor = `rgb(${data.red}, ${data.green}, ${data.blue})`;
       }
     };
+
+    function updateSpectrum(bands) {
+      const container = document.getElementById('spectrumBars');
+      
+      // Clear existing bars if band count changed
+      if (container.children.length !== bands.length) {
+        container.innerHTML = '';
+        
+        // Create bars for all frequency bands
+        for (let i = 0; i < bands.length; i++) {
+          const bar = document.createElement('div');
+          bar.className = 'spectrum-bar';
+          bar.style.cssText = `
+            background: hsl(${(i * 360) / bands.length}, 70%, 50%);
+            width: ${Math.max(2, 300 / bands.length)}px;
+            height: 0%;
+            transition: height 0.1s ease;
+            border-radius: 2px 2px 0 0;
+            margin: 0 1px;
+          `;
+          container.appendChild(bar);
+        }
+      }
+      
+      // Update all bars
+      const bars = container.children;
+      for (let i = 0; i < bands.length && i < bars.length; i++) {
+        const magnitude = bands[i] || 0;
+        const height = Math.max(magnitude * 100, magnitude > 0 ? 2 : 0);
+        bars[i].style.height = `${height}%`;
+        
+        // Add glow effect for active bars
+        if (magnitude > 0.05) {
+          bars[i].style.boxShadow = `0 0 8px ${bars[i].style.background}`;
+          bars[i].style.opacity = '1';
+        } else {
+          bars[i].style.boxShadow = 'none';
+          bars[i].style.opacity = '0.3';
+        }
+      }
+    }
 
     socket.onopen = () => {
       console.log('WebSocket connected');

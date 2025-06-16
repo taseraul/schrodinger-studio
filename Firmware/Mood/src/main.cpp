@@ -141,20 +141,43 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
         break;
       case DATA_PACKET:
         if (auto_pair()) {
-          memcpy(&lightData, incomingData, sizeof(lightData));
-          if (memcmp(mac, serverAddress, 6) == 0) {
-            red = (uint32_t)deviceConfig.rgb[0] * lightData.data[deviceConfig.band] / 255;
-            green = (uint32_t)deviceConfig.rgb[1] * lightData.data[deviceConfig.band] / 255;
-            blue = (uint32_t)deviceConfig.rgb[2] * lightData.data[deviceConfig.band] / 255;
+          // Handle new frequency data packet format
+          if (len == sizeof(struct_frequency_data)) {
+            struct_frequency_data* freq_data = (struct_frequency_data*)incomingData;
+            if (memcmp(mac, serverAddress, 6) == 0) {
+              // Get magnitude for this device's assigned band
+              uint8_t magnitude = freq_data->bands[deviceConfig.band];
+              
+              red = (uint32_t)deviceConfig.rgb[0] * magnitude / 255;
+              green = (uint32_t)deviceConfig.rgb[1] * magnitude / 255;
+              blue = (uint32_t)deviceConfig.rgb[2] * magnitude / 255;
 
-            Serial.println("FPS : ");
-            Serial.println(1000.0 / (millis() - timer));
-            timer = millis();
+              Serial.printf("Band %d magnitude: %d, RGB: %d,%d,%d\n", 
+                           deviceConfig.band, magnitude, red, green, blue);
 
-            if (!isFlashlight && auto_update) {
-              ledcWrite(0, 255 - red);
-              ledcWrite(1, 255 - green);
-              ledcWrite(2, 255 - blue);
+              if (!isFlashlight && auto_update) {
+                ledcWrite(0, 255 - red);
+                ledcWrite(1, 255 - green);
+                ledcWrite(2, 255 - blue);
+              }
+            }
+          } else {
+            // Fallback to old message format
+            memcpy(&lightData, incomingData, sizeof(lightData));
+            if (memcmp(mac, serverAddress, 6) == 0) {
+              red = (uint32_t)deviceConfig.rgb[0] * lightData.data[deviceConfig.band] / 255;
+              green = (uint32_t)deviceConfig.rgb[1] * lightData.data[deviceConfig.band] / 255;
+              blue = (uint32_t)deviceConfig.rgb[2] * lightData.data[deviceConfig.band] / 255;
+
+              Serial.println("FPS : ");
+              Serial.println(1000.0 / (millis() - timer));
+              timer = millis();
+
+              if (!isFlashlight && auto_update) {
+                ledcWrite(0, 255 - red);
+                ledcWrite(1, 255 - green);
+                ledcWrite(2, 255 - blue);
+              }
             }
           }
         }
