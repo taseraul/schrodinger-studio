@@ -8,6 +8,7 @@
 #include "config.hpp"
 #include "i2s.hpp"
 #include "bt.hpp"
+#include "circular_buffer.hpp"
 #include "Arduino.h"
 #include "arduinoFFT.h"
 
@@ -106,25 +107,48 @@ static void convert_to_mono() {
 static bool send_peaks(peak_t *magnitudes, int length) {
     if (peaks_queue == NULL) return false;
     
+    // Check if queue is full and clean up old messages to prevent memory leak
+    UBaseType_t queue_count = uxQueueMessagesWaiting(peaks_queue);
+    if (queue_count >= MAX_LED_QUEUE) {
+        // Queue is full, remove and free old messages
+        peak_msg_t *old_msg;
+        while (xQueueReceive(peaks_queue, &old_msg, 0) == pdTRUE) {
+            if (old_msg) {
+                if (old_msg->values) {
+                    free(old_msg->values);
+                }
+                free(old_msg);
+            }
+        }
+        ESP_LOGW("fft", "Cleared full peaks queue to prevent memory leak");
+    }
+    
     TickType_t timeout_ticks = 0;
     
     // Allocate message struct and values buffer
     peak_msg_t *msg = (peak_msg_t *)malloc(sizeof(peak_msg_t));
-    if (!msg) return false;
+    if (!msg) {
+        ESP_LOGE("fft", "Failed to allocate peak message");
+        return false;
+    }
     msg->length = length;
     msg->values = (float *)malloc(length * sizeof(float));
     if (!msg->values) {
         free(msg);
+        ESP_LOGE("fft", "Failed to allocate peak values");
         return false;
     }
 
-    // Copy magnitudes
-    memcpy(msg->values, magnitudes, length * sizeof(float));
+    // Copy magnitudes (copy the magnitude values, not the whole peak_t struct)
+    for (int i = 0; i < length; i++) {
+        msg->values[i] = magnitudes[i].magnitude;
+    }
 
     // Send pointer to queue
     if (xQueueSend(peaks_queue, &msg, timeout_ticks) != pdTRUE) {
         free(msg->values);
         free(msg);
+        ESP_LOGW("fft", "Failed to send peak message to queue");
         return false;
     }
 
@@ -132,71 +156,124 @@ static bool send_peaks(peak_t *magnitudes, int length) {
 }
 
 static void fft_task(void *param) {
+  static int fft_process_counter = 0;
+  static int heartbeat_counter = 0;
+  
+  ESP_LOGI("fft", "FFT task started successfully");
+  
   while (true) {
-    if (READ_SAMPLES(samples_copy, sizeof(samples_copy) / sizeof(samples_copy[0]))) {
-      convert_to_mono();
+    // Heartbeat logging to confirm task is running
+    if (++heartbeat_counter >= 1000) {
+      heartbeat_counter = 0;
+      ESP_LOGI("fft", "FFT task heartbeat - Buffer: %d/%d, Overflows: %d", 
+               bt_circular_buffer.available(), bt_circular_buffer.capacity(),
+               bt_circular_buffer.get_overflow_count());
+    }
+    
+    // Aggressively consume data to prevent buffer overflow
+    bool data_processed = false;
+    int buffers_consumed = 0;
+    
+    // Process multiple buffers per cycle to catch up with incoming data
+    for (int i = 0; i < 5; i++) {
+      ESP_LOGD("fft", "Attempting to read samples, iteration %d", i);
+      
+      if (READ_SAMPLES(samples_copy, sizeof(samples_copy) / sizeof(samples_copy[0]))) {
+        data_processed = true;
+        buffers_consumed++;
+        ESP_LOGD("fft", "Successfully read buffer %d, total consumed: %d", i, buffers_consumed);
+        
+        // Do FFT processing on every buffer
+        convert_to_mono();
 
-      FFT.windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
-      FFT.compute(FFT_FORWARD);
-      FFT.complexToMagnitude();
+        FFT.windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+        FFT.compute(FFT_FORWARD);
+        FFT.complexToMagnitude();
 
-      peak_t peaks[MAX_BIN];
-      for (int i = 0; i < MAX_BIN; i++) {
-        peaks[i].index = i;
-        peaks[i].magnitude = fft_real[i];
-      }
+        peak_t peaks[MAX_BIN];
+        for (int j = 0; j < MAX_BIN; j++) {
+          peaks[j].index = j;
+          peaks[j].magnitude = fft_real[j];
+        }
 
-      qsort(peaks, MAX_BIN, sizeof(peak_t), cmp_peak);
+        qsort(peaks, MAX_BIN, sizeof(peak_t), cmp_peak);
 
-      int current_num_highest;
-      int current_min_width;
+        int current_num_highest;
+        int current_min_width;
 
-      // Lock config to read current values
-      if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(10))) {
-        current_num_highest = num_highest;
-        current_min_width = min_width;
-        xSemaphoreGive(config_mutex);
-      } else {
-        // fallback to defaults if mutex not available
-        current_num_highest = 6;
-        current_min_width = 10;
-      }
+        // Lock config to read current values
+        if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(10))) {
+          current_num_highest = num_highest;
+          current_min_width = min_width;
+          xSemaphoreGive(config_mutex);
+        } else {
+          // fallback to defaults if mutex not available
+          current_num_highest = 6;
+          current_min_width = 10;
+        }
 
-      peak_t selected[current_num_highest];
-      int count = 0;
+        peak_t selected[current_num_highest];
+        int count = 0;
 
-      memset(selected,0, sizeof(selected));
+        memset(selected,0, sizeof(selected));
 
-      for (int i = 0; i < MAX_BIN && count < current_num_highest; i++) {
-        int candidate = peaks[i].index;
-        bool too_close = false;
-        for (int j = 0; j < count; j++) {
-          if (abs(selected[j].index - candidate) < current_min_width) {
-            too_close = true;
-            break;
+        for (int k = 0; k < MAX_BIN && count < current_num_highest; k++) {
+          int candidate = peaks[k].index;
+          bool too_close = false;
+          for (int j = 0; j < count; j++) {
+            if (abs(selected[j].index - candidate) < current_min_width) {
+              too_close = true;
+              break;
+            }
+          }
+          if (!too_close) {
+            selected[count++] = peaks[k];
           }
         }
-        if (!too_close) {
-          selected[count++] = peaks[i];
-        }
+
+        normalize_magnitudes(selected,current_num_highest);
+        sort_peaks_by_index(selected,current_num_highest);
+
+        // Log peaks in single line format every time
+        ESP_LOGI("fft", "Peaks: %.3f %.3f %.3f %.3f %.3f %.3f", 
+                 selected[0].magnitude, selected[1].magnitude, selected[2].magnitude,
+                 selected[3].magnitude, selected[4].magnitude, selected[5].magnitude);
+
+        send_peaks(selected,current_num_highest);
+        
+        // Yield CPU after each FFT to allow BT task to run
+        taskYIELD();
+      } else {
+        ESP_LOGD("fft", "No more data available at iteration %d", i);
+        break; // No more data available
       }
-
-      normalize_magnitudes(selected,current_num_highest);
-      sort_peaks_by_index(selected,current_num_highest);
-
-      send_peaks(selected,current_num_highest);
     }
-
-    vTaskDelay(pdMS_TO_TICKS(16));
+    
+    if (buffers_consumed > 0) {
+      ESP_LOGD("fft", "Consumed %d buffers this cycle", buffers_consumed);
+    }
+    
+    // Much more aggressive timing - prioritize data consumption
+    if (data_processed) {
+      vTaskDelay(pdMS_TO_TICKS(1)); // Very short delay when processing data
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(5)); // Short delay when no data
+    }
   }
 }
 
 void fft_task_init() {
+  ESP_LOGI("fft", "Initializing FFT task...");
+  
   peaks_queue = xQueueCreate(MAX_LED_QUEUE, sizeof(peak_msg_t *));
+  if (!peaks_queue) {
+    ESP_LOGE("fft", "Failed to create peaks queue");
+    return;
+  }
 
   config_mutex = xSemaphoreCreateMutex();
   if (!config_mutex) {
-    Serial.println("Config mutex creation failed");
+    ESP_LOGE("fft", "Config mutex creation failed");
     return;
   }
 
@@ -207,7 +284,21 @@ void fft_task_init() {
     xSemaphoreGive(config_mutex);
   }
 
-  xTaskCreate(fft_task, "fft_task", 4096, NULL, 5, NULL);
+  // Create FFT task with lower priority than BT task
+  TaskHandle_t fft_task_handle = NULL;
+  BaseType_t result = xTaskCreate(fft_task, "fft_task", 8192, NULL, 3, &fft_task_handle);
+  
+  if (result != pdPASS) {
+    ESP_LOGE("fft", "Failed to create FFT task, error: %d", result);
+    return;
+  }
+  
+  if (fft_task_handle == NULL) {
+    ESP_LOGE("fft", "FFT task handle is NULL");
+    return;
+  }
+  
+  ESP_LOGI("fft", "FFT task created successfully with handle: %p", fft_task_handle);
 }
 
 // Thread-safe setters/getters

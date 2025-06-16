@@ -75,10 +75,12 @@ void setup() {
     // Force garbage collection
     ESP.getHeapSize(); // This can trigger cleanup
     
+    // Initialize FFT task to process BT audio samples
+    fft_task_init();
+    ESP_LOGI(TAG, "After FFT task init - Heap: %d bytes", ESP.getFreeHeap());
+    
     // IMPORTANT: Do NOT initialize I2S separately when using Bluetooth A2DP
     // The A2DP library handles its own I2S initialization on different pins
-    // Uncomment these only if you want to use I2S input without Bluetooth:
-    // fft_task_init();
     // i2s_init();  // This conflicts with A2DP I2S initialization
     
     ESP_LOGI(TAG, "System initialization completed successfully");

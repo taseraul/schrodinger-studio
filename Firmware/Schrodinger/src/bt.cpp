@@ -6,6 +6,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "bt_monitor.hpp"
+#include "circular_buffer.hpp"
 #include "esp_log.h"
 
 static const char* TAG = "bt";
@@ -16,61 +17,94 @@ BluetoothA2DPSink a2dp_sink(scaledBt);
 #define BT_TASK_STACK_SIZE 8192
 #define BT_TASK_PRIORITY   10
 
-static uint32_t samples[SAMPLES * 2];   // For writing from I2S
-
-// Mutex for protecting buffers
-static SemaphoreHandle_t buffer_mutex;
-
-// Flag to indicate new data is ready
-static volatile bool buffer_ready = false;
+// Dynamic buffer for sample conversion - allocate based on incoming data size
+#define MAX_BT_SAMPLES 2048  // Maximum samples we can handle per callback
 
 void receiveBtSamples(const uint8_t* data, uint32_t length) 
 {
-  ESP_LOGI("bt","Samples read %d",length);
+  // Safety checks
+  if (!data || length == 0) {
+    ESP_LOGW(TAG, "Invalid data received: data=%p, length=%d", data, length);
+    return;
+  }
+  
+  ESP_LOGD(TAG, "BT samples received: %d bytes", length);
   
   // Update BT state to indicate audio is playing
   bt_state_changed(BT_AUDIO_PLAYING);
   
-  // if (xSemaphoreTake(buffer_mutex, 0)) {
-    memcpy(samples,data,length);      
-    buffer_ready = true;
-  //   xSemaphoreGive(buffer_mutex);
-  // }
-}
-
-bool readBtSamples(uint32_t* dest, size_t length){
-  if (length < SAMPLES * 2) return false;
-
-  bool copied = false;
-  if (buffer_ready && xSemaphoreTake(buffer_mutex, 0)) {
-    memcpy(dest, samples, sizeof(samples));
-    buffer_ready = false;
-    xSemaphoreGive(buffer_mutex);
-    copied = true;
+  // Determine sample format and convert to 32-bit
+  size_t sample_count = 0;
+  
+  // Assume 16-bit stereo samples (most common A2DP format)
+  if (length % 4 == 0) { // 16-bit stereo: 2 bytes per channel * 2 channels = 4 bytes per sample pair
+    sample_count = length / 4;
+    
+    // Handle dynamic input size - allocate temporary buffer as needed
+    if (sample_count > MAX_BT_SAMPLES) {
+      ESP_LOGW(TAG, "Sample count very large: %d, limiting to %d", sample_count, MAX_BT_SAMPLES);
+      sample_count = MAX_BT_SAMPLES;
+    }
+    
+    // Allocate temporary buffer for this batch
+    uint32_t* temp_samples = (uint32_t*)malloc(sample_count * 2 * sizeof(uint32_t));
+    if (!temp_samples) {
+      ESP_LOGE(TAG, "Failed to allocate temp buffer for %d samples", sample_count * 2);
+      return;
+    }
+    
+    const int16_t* samples_16 = (const int16_t*)data;
+    
+    // Convert 16-bit samples to 32-bit and store in temp buffer
+    for (size_t i = 0; i < sample_count * 2; i++) {
+      // Scale 16-bit to 32-bit range
+      int32_t sample_32 = (int32_t)samples_16[i] * 65536;
+      temp_samples[i] = (uint32_t)sample_32;
+    }
+    
+    // Write to circular buffer
+    size_t written = bt_circular_buffer.write(temp_samples, sample_count * 2);
+    if (written < sample_count * 2) {
+      ESP_LOGD(TAG, "Circular buffer partial write: %d/%d samples", written, sample_count * 2);
+    }
+    
+    // Free temporary buffer
+    free(temp_samples);
+  } else {
+    ESP_LOGW(TAG, "Unexpected sample format, length: %d", length);
   }
-  return copied;
 }
 
-// // High-priority task: reads samples from BT
-// void bt_task(void *param) {
-//   size_t bytes_read;
-//   uint8_t temp_buffer[SAMPLES * 8];  // 2 channels × 4 bytes = 8 bytes/sample pair
-
-//   while (true) {
-//     size_t res = scaledBt.readBytes(temp_buffer, sizeof(temp_buffer));
-
-//     if (res == sizeof(temp_buffer)) {
-//       if (xSemaphoreTake(buffer_mutex, 0)) {
-//         memcpy(samples, temp_buffer, sizeof(temp_buffer));
-//         buffer_ready = true;
-//         xSemaphoreGive(buffer_mutex);
-//         ESP_LOGI("bt","Samples read");
-//       }
-//     }
-
-//     vTaskDelay(pdMS_TO_TICKS(2));
-//   }
-// }
+bool readBtSamples(uint32_t* dest, size_t length) {
+  ESP_LOGD(TAG, "readBtSamples called, length=%d, required=%d", length, SAMPLES * 2);
+  
+  if (length < SAMPLES * 2) {
+    ESP_LOGW(TAG, "readBtSamples: length too small %d < %d", length, SAMPLES * 2);
+    return false;
+  }
+  
+  // Check buffer status before reading
+  size_t available = bt_circular_buffer.available();
+  ESP_LOGD(TAG, "Buffer has %d samples available", available);
+  
+  // Try to read exactly SAMPLES * 2 samples from circular buffer
+  size_t read_count = bt_circular_buffer.read(dest, SAMPLES * 2);
+  
+  ESP_LOGD(TAG, "Read %d samples from buffer", read_count);
+  
+  if (read_count == SAMPLES * 2) {
+    ESP_LOGD(TAG, "Full read successful: %d samples", read_count);
+    return true;
+  } else if (read_count > 0) {
+    // Partial read - pad with zeros
+    memset(&dest[read_count], 0, (SAMPLES * 2 - read_count) * sizeof(uint32_t));
+    ESP_LOGD(TAG, "Partial read: %d/%d samples, padded with zeros", read_count, SAMPLES * 2);
+    return true;
+  }
+  
+  ESP_LOGD(TAG, "No samples available for reading");
+  return false; // No samples available
+}
 
 void bt_init() {
   ESP_LOGI(TAG, "Initializing Bluetooth A2DP Sink...");
@@ -90,38 +124,12 @@ void bt_init() {
   WiFi.mode(WIFI_OFF);
   delay(500);  // Allow WiFi to fully shut down
   
-  // Create buffer mutex with error checking
-  buffer_mutex = xSemaphoreCreateMutex();
-  if (!buffer_mutex) {
-    ESP_LOGE(TAG, "Buffer mutex creation failed");
+  // Initialize circular buffer for BT samples
+  // Use 16384 samples (32x FFT size) for better buffering capacity
+  if (!bt_circular_buffer.init(16384)) {
+    ESP_LOGE(TAG, "Failed to initialize circular buffer");
     return;
   }
-  
-  // Configure I2S settings BEFORE starting A2DP to prevent conflicts
-  // Use different pins than the existing I2S RX configuration
-  i2s_pin_config_t my_pin_config = {
-      .bck_io_num   = 26,  // Changed from 14 to avoid conflict
-      .ws_io_num    = 25,  // Changed from 15 to avoid conflict  
-      .data_out_num = 32,
-      .data_in_num  = I2S_PIN_NO_CHANGE
-  };
-
-  i2s_config_t i2s_config = {
-      .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-      .sample_rate          = 44100,
-      .bits_per_sample      = (i2s_bits_per_sample_t)16,  // Changed from 32 to 16 to save memory
-      .channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT,
-      .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_STAND_I2S),
-      .intr_alloc_flags     = 0,
-      .dma_buf_count        = 4,  // Further reduced to save memory
-      .dma_buf_len          = 32, // Further reduced to save memory
-      .use_apll             = false,  // Disabled to save memory
-      .tx_desc_auto_clear   = true
-  };
-  
-  // Set I2S configuration before starting A2DP
-  a2dp_sink.set_i2s_config(i2s_config);
-  a2dp_sink.set_pin_config(my_pin_config);
   
   // Set up the stream reader callback
   a2dp_sink.set_stream_reader(receiveBtSamples, false);
