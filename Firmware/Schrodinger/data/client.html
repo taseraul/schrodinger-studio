@@ -63,12 +63,35 @@
       border: 1px solid #ccc;
       cursor: pointer;
     }
+    .fft-bin {
+      background: linear-gradient(to top, #4CAF50, #8BC34A, #CDDC39);
+      border-radius: 1.5px;
+      transition: height 0.1s ease-out, width 0.1s ease-out;
+      min-height: 3px;
+      opacity: 0.8;
+      flex-shrink: 0;
+    }
+    .fft-bin.zero {
+      height: 3px !important;
+      border-radius: 50%;
+      background: #ddd;
+      opacity: 0.3;
+    }
+    .fft-bin.active {
+      opacity: 1;
+    }
   </style>
 </head>
 <body>
   <div class="card">
     <div class="list" id="deviceList"></div>
-    <div id="right" style="flex: 1; padding: 2rem;">Right side content</div>
+    <div id="right" style="flex: 1; padding: 2rem; display: flex; flex-direction: column;">
+      <div style="flex: 1;">Right side content</div>
+      <div id="fftContainer" style="height: 200px; border-top: 1px solid #ddd; padding-top: 1rem;">
+        <h3 style="margin: 0 0 1rem 0; font-size: 1rem; color: #666;">FFT Spectrum</h3>
+        <div id="fftDisplay" style="height: 150px; display: flex; align-items: end; width: 100%; overflow: hidden;"></div>
+      </div>
+    </div>
   </div>
 
   <input type="color" id="colorPicker" style="position: absolute; visibility: hidden;">
@@ -81,8 +104,139 @@
     const colorPicker = document.getElementById("colorPicker");
     let currentColorEdit = null;
 
+    // FFT visualization variables
+    const MAX_BINS = 116; // Based on MAX_BIN calculation: (10000 * 512) / 44100 ≈ 116
+    const fftDisplay = document.getElementById('fftDisplay');
+    let fftBins = [];
+    let activeBins = new Set();
+
+    // Calculate bin widths to fill horizontal space evenly
+    // All bins have equal width
+    function calculateBinWidths() {
+      const containerWidth = fftDisplay.clientWidth;
+      const binWidth = Math.max(1, containerWidth / MAX_BINS);
+      
+      return { inactive: binWidth, active: binWidth };
+    }
+
+    // Initialize FFT bins
+    function initFFTDisplay() {
+      fftDisplay.innerHTML = '';
+      fftBins = [];
+      activeBins.clear();
+      
+      for (let i = 0; i < MAX_BINS; i++) {
+        const bin = document.createElement('div');
+        bin.className = 'fft-bin zero';
+        bin.style.height = '3px';
+        bin.title = `Bin ${i} (${Math.round(i * 44100 / 512)}Hz)`;
+        fftDisplay.appendChild(bin);
+        fftBins.push(bin);
+      }
+      
+      // Set initial widths (all inactive)
+      updateBinWidths();
+      console.log(`Initialized ${MAX_BINS} FFT bins`);
+    }
+
+    // Update bin widths based on active/inactive status
+    function updateBinWidths() {
+      const widths = calculateBinWidths();
+      
+      fftBins.forEach((bin, index) => {
+        const isActive = activeBins.has(index);
+        bin.style.width = `${isActive ? widths.active : widths.inactive}px`;
+      });
+    }
+
+    // Animate through multiple FFT frames
+    let animationFrameIndex = 0;
+    let animationFrames = [];
+    let animationTimer = null;
+    
+    function animateFFTFrames(frames) {
+      // Store frames for animation
+      animationFrames = frames;
+      animationFrameIndex = 0;
+      
+      // Clear any existing animation
+      if (animationTimer) {
+        clearInterval(animationTimer);
+      }
+      
+      // Grey out all bins before starting animation to prevent visual artifacts
+      fftBins.forEach(bin => {
+        bin.className = 'fft-bin zero';
+        bin.style.height = '3px';
+      });
+      activeBins.clear();
+      
+      // Start animation - play frames over ~167ms (to match 6Hz rate)
+      const frameInterval = Math.max(10, 167 / frames.length); // At least 10ms per frame
+      
+      animationTimer = setInterval(() => {
+        if (animationFrameIndex < animationFrames.length) {
+          updateFFT(animationFrames[animationFrameIndex]);
+          animationFrameIndex++;
+        } else {
+          clearInterval(animationTimer);
+          animationTimer = null;
+        }
+      }, frameInterval);
+      
+      console.log(`Animating ${frames.length} FFT frames at ${frameInterval.toFixed(1)}ms intervals`);
+    }
+
+    // Update FFT visualization
+    function updateFFT(fftData) {
+      // Clear previous active bins
+      const previousActiveBins = new Set(activeBins);
+      activeBins.clear();
+      
+      // Reset all bins to zero state
+      fftBins.forEach(bin => {
+        bin.className = 'fft-bin zero';
+        bin.style.height = '3px';
+      });
+
+      // Parse FFT data: [bin, magnitude, bin, magnitude, ...]
+      for (let i = 0; i < fftData.length; i += 2) {
+        const binIndex = fftData[i];
+        const magnitude = fftData[i + 1];
+        
+        if (binIndex >= 0 && binIndex < MAX_BINS && magnitude > 0) {
+          activeBins.add(binIndex);
+          const bin = fftBins[binIndex];
+          bin.className = 'fft-bin active';
+          // Scale magnitude to display height (3px to 147px)
+          const height = Math.max(3, Math.round(magnitude * 144 + 3));
+          bin.style.height = `${height}px`;
+        }
+      }
+      
+      // Update widths only if active bins changed
+      if (activeBins.size !== previousActiveBins.size || 
+          ![...activeBins].every(bin => previousActiveBins.has(bin))) {
+        updateBinWidths();
+      }
+    }
+
     socket.onmessage = (event) => {
       const data = JSON.parse(event.data);
+      
+      // Handle FFT batch data
+      if (data.frames) {
+        animateFFTFrames(data.frames);
+        return;
+      }
+      
+      // Handle single FFT data (legacy support)
+      if (data.f) {
+        updateFFT(data.f);
+        return;
+      }
+
+      // Handle device data
       const { id } = data;
       let existing = document.getElementById(`device-${id}`);
 
@@ -210,6 +364,25 @@
 
       socket.send(JSON.stringify({ id: currentColorEdit, red: r, green: g, blue: b }));
     });
+
+    // Handle window resize to recalculate bin widths
+    window.addEventListener('resize', () => {
+      if (fftBins.length > 0) {
+        updateBinWidths();
+      }
+    });
+
+    // Initialize FFT display when page loads
+    document.addEventListener('DOMContentLoaded', () => {
+      initFFTDisplay();
+    });
+
+    // Also initialize immediately in case DOMContentLoaded already fired
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', initFFTDisplay);
+    } else {
+      initFFTDisplay();
+    }
   </script>
 </body>
 </html>

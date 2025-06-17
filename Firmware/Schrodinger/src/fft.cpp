@@ -9,6 +9,7 @@
 #include "config.hpp"
 #include "i2s.hpp"
 #include "bt.hpp"
+#include "webserver.hpp"
 #include "Arduino.h"
 
 // #define READ_SAMPLES read_all_samples
@@ -141,6 +142,13 @@ static void fft_task(void *param) {
   uint32_t total_fft_time_us = 0;
   uint32_t max_fft_time_us = 0;
   uint32_t min_fft_time_us = UINT32_MAX;
+  
+  // WebSocket batching - collect 5 cycles, send at 6Hz (every 167ms)
+  uint32_t last_websocket_send = 0;
+  const uint32_t WEBSOCKET_INTERVAL_MS = 167; // 6Hz
+  const int BATCH_SIZE = 5;
+  String fft_batch = "";
+  int batch_count = 0;
   
   // Detailed step timing accumulators
   uint32_t total_mono_time_us = 0;
@@ -286,6 +294,39 @@ static void fft_task(void *param) {
       sort_peaks_by_index(selected,current_num_highest);
       step_end_time = esp_timer_get_time();
       total_final_sort_time_us += (step_end_time - step_start_time);
+
+      // Step 9.5: Batch FFT data for WebSocket (collect 5 cycles, send at 6Hz)
+      if (count > 0) {
+        // Add current FFT data to batch
+        if (batch_count > 0) {
+          fft_batch += ",";
+        }
+        fft_batch += "[";
+        for (int i = 0; i < count; i++) {
+          if (i > 0) fft_batch += ",";
+          fft_batch += String(selected[i].index) + "," + String(selected[i].magnitude, 2);
+        }
+        fft_batch += "]";
+        batch_count++;
+        
+        // Send batch when we have 5 cycles or enough time has passed
+        uint32_t current_time = millis();
+        if (batch_count >= BATCH_SIZE || (current_time - last_websocket_send >= WEBSOCKET_INTERVAL_MS)) {
+          String json = "{\"frames\":[" + fft_batch + "]}";
+          notifyClients(json);
+          last_websocket_send = current_time;
+          
+          // Reset batch
+          fft_batch = "";
+          batch_count = 0;
+          
+          // Log WebSocket transmission periodically
+          if (successful_ffts % 200 == 0) {
+            ESP_LOGI("fft", "WebSocket FFT batch sent (6Hz, %d frames): %d bytes", 
+                     batch_count == 0 ? BATCH_SIZE : batch_count, json.length());
+          }
+        }
+      }
 
       // Log FFT peaks with frequencies and magnitudes
       if (count > 0) {

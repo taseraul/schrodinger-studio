@@ -134,7 +134,9 @@ void initWebSocket() {
 
 // Notify all WebSocket clients
 void notifyClients(String json) {
-  ws.textAll(json);
+  if (ws.count() > 0) {
+    ws.textAll(json);
+  }
 }
 
 // Initialize web server
