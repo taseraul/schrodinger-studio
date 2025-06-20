@@ -88,6 +88,8 @@ void setup() {
 // Memory monitoring variables
 unsigned long lastMemoryCheck = 0;
 const unsigned long MEMORY_CHECK_INTERVAL = 5000; // Check every 5 seconds
+uint32_t initialHeap = 0;
+uint32_t minHeapSeen = UINT32_MAX;
 
 void loop() {
     // Memory monitoring and recovery
@@ -97,11 +99,35 @@ void loop() {
         
         uint32_t freeHeap = ESP.getFreeHeap();
         uint32_t freePsram = ESP.getFreePsram();
+        uint32_t largestBlock = ESP.getMaxAllocHeap();
         BtConnectionState btState = get_bt_state();
         
-        // Log memory status periodically
-        Serial.printf("Memory Status - Heap: %d bytes, PSRAM: %d bytes, BT State: %d\n", 
-                     freeHeap, freePsram, btState);
+        // Track minimum heap seen
+        if (freeHeap < minHeapSeen) {
+            minHeapSeen = freeHeap;
+        }
+        
+        // Initialize baseline on first run
+        if (initialHeap == 0) {
+            initialHeap = freeHeap;
+        }
+        
+        int32_t heapChange = (int32_t)freeHeap - (int32_t)initialHeap;
+        
+        // Enhanced memory logging with leak detection
+        ESP_LOGI(TAG, "MEMORY: Heap=%d (Δ%d), Min=%d, PSRAM=%d, Block=%d, BT=%d", 
+                 freeHeap, heapChange, minHeapSeen, freePsram, largestBlock, btState);
+        
+        // Detect potential memory leaks
+        if (heapChange < -15000) {
+            ESP_LOGW(TAG, "MEMORY LEAK WARNING: Heap dropped %d bytes from baseline", -heapChange);
+        }
+        
+        // Log WebSocket client count for correlation
+        ESP_LOGI(TAG, "WebSocket clients: %d", getWebSocketClientCount());
+        
+        // Perform WebSocket health check and cleanup
+        websocketHealthCheck();
         
         // Check memory health using memory manager
         if (!check_memory_health()) {

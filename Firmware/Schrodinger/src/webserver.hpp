@@ -9,5 +9,9 @@ int  get_channel();
 void fs_init();
 void setServerMac(uint8_t* mac);
 void notifyClients(String json);
+void sendBinaryBatch(const uint8_t* data, size_t length);
+int  getWebSocketClientCount();
+void websocketHealthCheck();
+void cleanupClientStats();
 
 #endif

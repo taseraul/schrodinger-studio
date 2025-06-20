@@ -10,6 +10,7 @@
 #include "i2s.hpp"
 #include "bt.hpp"
 #include "webserver.hpp"
+#include "memory_manager.hpp"
 #include "Arduino.h"
 
 // #define READ_SAMPLES read_all_samples
@@ -30,17 +31,11 @@ typedef struct {
   float magnitude;
 } peak_t;
 
-typedef struct {
-    int length;      // Number of magnitudes
-    float *values;   // Dynamically allocated array of magnitudes
-} peak_msg_t;
-
-static uint32_t samples_copy[SAMPLES * 2];
-static float fft_input[SAMPLES * 2];  // ESP-DSP requires interleaved real/imag format
-static float fft_output[SAMPLES];     // Magnitude output
-static float temp_real[SAMPLES];      // Static allocation to avoid stack overflow
-
-static QueueHandle_t peaks_queue = NULL;
+// PSRAM-allocated buffers for FFT processing
+static uint32_t* samples_copy = nullptr;
+static float* fft_input = nullptr;     // ESP-DSP requires interleaved real/imag format
+static float* fft_output = nullptr;    // Magnitude output
+static float* temp_real = nullptr;     // PSRAM allocation to save internal RAM
 
 // ESP-DSP FFT initialization
 static bool esp_dsp_initialized = false;
@@ -50,6 +45,102 @@ static int num_highest = 6;
 static int min_width = 10;
 
 static float smoothed_max_mag = 1e-6f; // initialize to small positive number
+
+// WebSocket management
+static uint32_t websocket_send_count = 0;
+static uint32_t websocket_send_failures = 0;
+static uint32_t last_websocket_health_check = 0;
+
+// Buffer allocation and deallocation functions
+static bool allocate_fft_buffers() {
+    ESP_LOGI("fft", "Allocating FFT buffers in PSRAM...");
+    
+    // Calculate buffer sizes
+    size_t samples_size = SAMPLES * 2 * sizeof(uint32_t);  // ~4KB
+    size_t fft_input_size = SAMPLES * 2 * sizeof(float);   // ~4KB
+    size_t fft_output_size = SAMPLES * sizeof(float);      // ~2KB
+    size_t temp_real_size = SAMPLES * sizeof(float);       // ~2KB
+    
+    ESP_LOGI("fft", "Buffer sizes: samples=%d, input=%d, output=%d, temp=%d bytes", 
+             samples_size, fft_input_size, fft_output_size, temp_real_size);
+    
+    // Allocate samples_copy buffer in PSRAM
+    samples_copy = (uint32_t*)malloc_psram_fallback(samples_size);
+    if (!samples_copy) {
+        ESP_LOGE("fft", "Failed to allocate samples_copy buffer (%d bytes)", samples_size);
+        return false;
+    }
+    
+    // Allocate fft_input buffer in PSRAM
+    fft_input = (float*)malloc_psram_fallback(fft_input_size);
+    if (!fft_input) {
+        ESP_LOGE("fft", "Failed to allocate fft_input buffer (%d bytes)", fft_input_size);
+        free_psram_fallback(samples_copy);
+        samples_copy = nullptr;
+        return false;
+    }
+    
+    // Allocate fft_output buffer in PSRAM
+    fft_output = (float*)malloc_psram_fallback(fft_output_size);
+    if (!fft_output) {
+        ESP_LOGE("fft", "Failed to allocate fft_output buffer (%d bytes)", fft_output_size);
+        free_psram_fallback(samples_copy);
+        free_psram_fallback(fft_input);
+        samples_copy = nullptr;
+        fft_input = nullptr;
+        return false;
+    }
+    
+    // Allocate temp_real buffer in PSRAM
+    temp_real = (float*)malloc_psram_fallback(temp_real_size);
+    if (!temp_real) {
+        ESP_LOGE("fft", "Failed to allocate temp_real buffer (%d bytes)", temp_real_size);
+        free_psram_fallback(samples_copy);
+        free_psram_fallback(fft_input);
+        free_psram_fallback(fft_output);
+        samples_copy = nullptr;
+        fft_input = nullptr;
+        fft_output = nullptr;
+        return false;
+    }
+    
+    // Clear all buffers
+    memset(samples_copy, 0, samples_size);
+    memset(fft_input, 0, fft_input_size);
+    memset(fft_output, 0, fft_output_size);
+    memset(temp_real, 0, temp_real_size);
+    
+    ESP_LOGI("fft", "FFT buffers allocated successfully in PSRAM (total: %d bytes)", 
+             samples_size + fft_input_size + fft_output_size + temp_real_size);
+    
+    return true;
+}
+
+static void deallocate_fft_buffers() {
+    ESP_LOGI("fft", "Deallocating FFT buffers...");
+    
+    if (samples_copy) {
+        free_psram_fallback(samples_copy);
+        samples_copy = nullptr;
+    }
+    
+    if (fft_input) {
+        free_psram_fallback(fft_input);
+        fft_input = nullptr;
+    }
+    
+    if (fft_output) {
+        free_psram_fallback(fft_output);
+        fft_output = nullptr;
+    }
+    
+    if (temp_real) {
+        free_psram_fallback(temp_real);
+        temp_real = nullptr;
+    }
+    
+    ESP_LOGI("fft", "FFT buffers deallocated");
+}
 
 // Call this every FFT frame with the current magnitudes array and length
 // It returns the normalized magnitudes scaled by gain
@@ -107,144 +198,67 @@ static void convert_to_mono() {
   }
 }
 
-static bool send_peaks(peak_t *magnitudes, int length) {
-    if (peaks_queue == NULL) return false;
-    
-    TickType_t timeout_ticks = 0;
-    
-    // Allocate message struct and values buffer
-    peak_msg_t *msg = (peak_msg_t *)malloc(sizeof(peak_msg_t));
-    if (!msg) return false;
-    msg->length = length;
-    msg->values = (float *)malloc(length * sizeof(float));
-    if (!msg->values) {
-        free(msg);
-        return false;
-    }
-
-    // Copy magnitudes
-    memcpy(msg->values, magnitudes, length * sizeof(float));
-
-    // Send pointer to queue
-    if (xQueueSend(peaks_queue, &msg, timeout_ticks) != pdTRUE) {
-        free(msg->values);
-        free(msg);
-        return false;
-    }
-
-    return true;
-}
-
 static void fft_task(void *param) {
   ESP_LOGI("fft", "FFT task started");
-  uint32_t loop_count = 0;
   uint32_t successful_ffts = 0;
-  uint32_t total_fft_time_us = 0;
-  uint32_t max_fft_time_us = 0;
-  uint32_t min_fft_time_us = UINT32_MAX;
   
-  // WebSocket batching - collect 5 cycles, send at 6Hz (every 167ms)
+  // Memory monitoring variables
+  uint32_t last_memory_check = 0;
+  uint32_t initial_heap = ESP.getFreeHeap();
+  
+  // Adaptive WebSocket batching - adjust rate based on client health
   uint32_t last_websocket_send = 0;
-  const uint32_t WEBSOCKET_INTERVAL_MS = 167; // 6Hz
-  const int BATCH_SIZE = 5;
-  String fft_batch = "";
+  uint32_t websocket_interval_ms = 167; // Start at 6Hz, adapt based on client health
+  const uint32_t MIN_WEBSOCKET_INTERVAL_MS = 100; // Max 10Hz
+  const uint32_t MAX_WEBSOCKET_INTERVAL_MS = 500; // Min 2Hz
+  int batch_size = 5; // Adaptive batch size
+  
+  // Use PSRAM-allocated buffer for WebSocket batching (binary format)
+  const size_t BATCH_BUFFER_SIZE = 2048;
+  uint8_t* fft_batch = (uint8_t*)malloc_psram_fallback(BATCH_BUFFER_SIZE);
+  if (!fft_batch) {
+    ESP_LOGE("fft", "Failed to allocate WebSocket batch buffer");
+    return;
+  }
+  memset(fft_batch, 0, BATCH_BUFFER_SIZE);
   int batch_count = 0;
   
-  // Detailed step timing accumulators
-  uint32_t total_mono_time_us = 0;
-  uint32_t total_windowing_time_us = 0;
-  uint32_t total_compute_time_us = 0;
-  uint32_t total_magnitude_time_us = 0;
-  uint32_t total_peak_prep_time_us = 0;
-  uint32_t total_peak_sort_time_us = 0;
-  uint32_t total_peak_select_time_us = 0;
-  uint32_t total_normalize_time_us = 0;
-  uint32_t total_final_sort_time_us = 0;
-  uint32_t total_send_time_us = 0;
+  // WebSocket health monitoring
+  uint32_t websocket_sends_attempted = 0;
+  uint32_t websocket_sends_skipped = 0;
   
   while (true) {
-    loop_count++;
-    
-    if (READ_SAMPLES(samples_copy, sizeof(samples_copy) / sizeof(samples_copy[0]))) {
+    if (READ_SAMPLES(samples_copy, SAMPLES * 2)) {
       successful_ffts++;
       
-      // Start timing FFT processing
-      uint32_t fft_start_time = esp_timer_get_time();
-      uint32_t step_start_time, step_end_time;
-      
-      if (successful_ffts <= 5 || successful_ffts % 100 == 0) {
+      // Minimal logging for first few FFTs
+      if (successful_ffts <= 3) {
         ESP_LOGI("fft", "FFT %d: Processing samples", successful_ffts);
       }
       
-      // Step 1: Mono conversion
-      step_start_time = esp_timer_get_time();
+      // Convert to mono
       convert_to_mono();
-      step_end_time = esp_timer_get_time();
-      total_mono_time_us += (step_end_time - step_start_time);
 
-      // Debug: Check input data
-      if (successful_ffts <= 3) {
-        ESP_LOGI("fft", "Input samples: [0]=%.3f [1]=%.3f [2]=%.3f [3]=%.3f", 
-                 fft_input[0], fft_input[2], fft_input[4], fft_input[6]);
-      }
-
-      // Step 2: FFT Windowing (ESP-DSP) - TEMPORARILY DISABLED FOR DEBUGGING
-      step_start_time = esp_timer_get_time();
-      // Skip windowing to test if it's causing the zero output issue
-      // TODO: Re-enable windowing once FFT is working correctly
-      step_end_time = esp_timer_get_time();
-      total_windowing_time_us += (step_end_time - step_start_time);
-
-      // Debug: Check windowed data
-      if (successful_ffts <= 3) {
-        ESP_LOGI("fft", "Windowed: [0]=%.3f [1]=%.3f [2]=%.3f [3]=%.3f", 
-                 fft_input[0], fft_input[2], fft_input[4], fft_input[6]);
-      }
-
-      // Step 3: FFT Compute (ESP-DSP)
-      step_start_time = esp_timer_get_time();
+      // FFT Compute (ESP-DSP)
       dsps_fft2r_fc32(fft_input, SAMPLES);
       dsps_bit_rev_fc32(fft_input, SAMPLES);
-      step_end_time = esp_timer_get_time();
-      total_compute_time_us += (step_end_time - step_start_time);
 
-      // Debug: Check FFT output
-      if (successful_ffts <= 3) {
-        ESP_LOGI("fft", "FFT out: [0]=%.3f+%.3fi [1]=%.3f+%.3fi [2]=%.3f+%.3fi", 
-                 fft_input[0], fft_input[1], fft_input[2], fft_input[3], fft_input[4], fft_input[5]);
-      }
-
-      // Step 4: Complex to Magnitude (ESP-DSP)
-      step_start_time = esp_timer_get_time();
+      // Complex to Magnitude
       for (int i = 0; i < SAMPLES/2; i++) {
         float real = fft_input[i * 2];
         float imag = fft_input[i * 2 + 1];
         fft_output[i] = sqrtf(real * real + imag * imag);
       }
-      step_end_time = esp_timer_get_time();
-      total_magnitude_time_us += (step_end_time - step_start_time);
 
-      // Debug: Check magnitude output
-      if (successful_ffts <= 3) {
-        ESP_LOGI("fft", "Magnitudes: [0]=%.3f [1]=%.3f [2]=%.3f [10]=%.3f [50]=%.3f", 
-                 fft_output[0], fft_output[1], fft_output[2], fft_output[10], fft_output[50]);
-      }
-
-      // Step 5: Peak preparation (skip DC bin 0)
-      step_start_time = esp_timer_get_time();
+      // Peak preparation (skip DC bin 0)
       peak_t peaks[MAX_BIN - 1];  // Exclude bin 0 (DC)
       for (int i = 1; i < MAX_BIN; i++) {  // Start from bin 1, skip DC
         peaks[i-1].index = i;
         peaks[i-1].magnitude = fft_output[i];
       }
-      step_end_time = esp_timer_get_time();
-      total_peak_prep_time_us += (step_end_time - step_start_time);
 
-      // Step 6: Peak sorting
-      step_start_time = esp_timer_get_time();
+      // Peak sorting
       qsort(peaks, MAX_BIN - 1, sizeof(peak_t), cmp_peak);  // Exclude DC bin
-      step_end_time = esp_timer_get_time();
-      total_peak_sort_time_us += (step_end_time - step_start_time);
 
       int current_num_highest;
       int current_min_width;
@@ -260,8 +274,7 @@ static void fft_task(void *param) {
         current_min_width = 10;
       }
 
-      // Step 7: Peak selection
-      step_start_time = esp_timer_get_time();
+      // Peak selection
       peak_t selected[current_num_highest];
       int count = 0;
 
@@ -280,143 +293,158 @@ static void fft_task(void *param) {
           selected[count++] = peaks[i];
         }
       }
-      step_end_time = esp_timer_get_time();
-      total_peak_select_time_us += (step_end_time - step_start_time);
 
-      // Step 8: Normalization
-      step_start_time = esp_timer_get_time();
+      // Normalization
       normalize_magnitudes(selected,current_num_highest);
-      step_end_time = esp_timer_get_time();
-      total_normalize_time_us += (step_end_time - step_start_time);
 
-      // Step 9: Final sorting
-      step_start_time = esp_timer_get_time();
+      // Final sorting
       sort_peaks_by_index(selected,current_num_highest);
-      step_end_time = esp_timer_get_time();
-      total_final_sort_time_us += (step_end_time - step_start_time);
 
-      // Step 9.5: Batch FFT data for WebSocket (collect 5 cycles, send at 6Hz)
+      // Binary WebSocket protocol - highly optimized
       if (count > 0) {
-        // Add current FFT data to batch
-        if (batch_count > 0) {
-          fft_batch += ",";
-        }
-        fft_batch += "[";
-        for (int i = 0; i < count; i++) {
-          if (i > 0) fft_batch += ",";
-          fft_batch += String(selected[i].index) + "," + String(selected[i].magnitude, 2);
-        }
-        fft_batch += "]";
-        batch_count++;
+        // Binary format: [frame_count][frame1_data][frame2_data]...
+        // Each frame: [peak_count][bin1][mag1][bin2][mag2]...
+        // bin: uint8_t (0-115), mag: uint8_t (0-255 scaled)
         
-        // Send batch when we have 5 cycles or enough time has passed
+        // Calculate required buffer size for this frame
+        size_t frame_size = 1 + (count * 2); // 1 byte count + 2 bytes per peak
+        
+        // Check if we have space in batch buffer
+        if (batch_count == 0) {
+          // First frame - write frame count placeholder and first frame
+          fft_batch[0] = 1; // Will be updated when batch is complete
+          fft_batch[1] = (uint8_t)count; // Peak count for this frame
+          
+          // Write peak data
+          for (int i = 0; i < count; i++) {
+            fft_batch[2 + i * 2] = (uint8_t)selected[i].index; // Bin index (0-115)
+            fft_batch[3 + i * 2] = (uint8_t)(selected[i].magnitude * 255.0f); // Magnitude (0-255)
+          }
+          batch_count = 1;
+        } else {
+          // Additional frame - append to batch
+          size_t current_batch_size = 1; // Frame count byte
+          
+          // Calculate current batch size
+          for (int f = 0; f < batch_count; f++) {
+            size_t frame_offset = 1; // Skip frame count
+            for (int prev_f = 0; prev_f < f; prev_f++) {
+              uint8_t prev_peak_count = fft_batch[frame_offset];
+              frame_offset += 1 + (prev_peak_count * 2);
+            }
+            uint8_t peak_count = fft_batch[frame_offset];
+            current_batch_size += 1 + (peak_count * 2);
+          }
+          
+          // Check if new frame fits
+          if (current_batch_size + frame_size < BATCH_BUFFER_SIZE) {
+            // Append new frame
+            fft_batch[current_batch_size] = (uint8_t)count;
+            for (int i = 0; i < count; i++) {
+              fft_batch[current_batch_size + 1 + i * 2] = (uint8_t)selected[i].index;
+              fft_batch[current_batch_size + 2 + i * 2] = (uint8_t)(selected[i].magnitude * 255.0f);
+            }
+            batch_count++;
+            fft_batch[0] = (uint8_t)batch_count; // Update frame count
+          } else {
+            // Buffer full, send current batch and start new one
+            sendBinaryBatch(fft_batch, current_batch_size);
+            websocket_sends_attempted++;
+            last_websocket_send = millis();
+            
+            // Start new batch with current frame
+            fft_batch[0] = 1;
+            fft_batch[1] = (uint8_t)count;
+            for (int i = 0; i < count; i++) {
+              fft_batch[2 + i * 2] = (uint8_t)selected[i].index;
+              fft_batch[3 + i * 2] = (uint8_t)(selected[i].magnitude * 255.0f);
+            }
+            batch_count = 1;
+          }
+        }
+        
+        // Send batch when we have enough cycles or enough time has passed
         uint32_t current_time = millis();
-        if (batch_count >= BATCH_SIZE || (current_time - last_websocket_send >= WEBSOCKET_INTERVAL_MS)) {
-          String json = "{\"frames\":[" + fft_batch + "]}";
-          notifyClients(json);
+        if (batch_count >= batch_size || (current_time - last_websocket_send >= websocket_interval_ms)) {
+          // Calculate final batch size
+          size_t final_batch_size = 1; // Frame count byte
+          for (int f = 0; f < batch_count; f++) {
+            size_t frame_offset = 1;
+            for (int prev_f = 0; prev_f < f; prev_f++) {
+              uint8_t prev_peak_count = fft_batch[frame_offset];
+              frame_offset += 1 + (prev_peak_count * 2);
+            }
+            uint8_t peak_count = fft_batch[frame_offset];
+            final_batch_size += 1 + (peak_count * 2);
+          }
+          
+          sendBinaryBatch(fft_batch, final_batch_size);
+          websocket_sends_attempted++;
           last_websocket_send = current_time;
           
           // Reset batch
-          fft_batch = "";
           batch_count = 0;
-          
-          // Log WebSocket transmission periodically
-          if (successful_ffts % 200 == 0) {
-            ESP_LOGI("fft", "WebSocket FFT batch sent (6Hz, %d frames): %d bytes", 
-                     batch_count == 0 ? BATCH_SIZE : batch_count, json.length());
-          }
         }
       }
 
-      // Log FFT peaks with frequencies and magnitudes
-      if (count > 0) {
-        char log_buffer[256];
-        int pos = 0;
-        pos += snprintf(log_buffer + pos, sizeof(log_buffer) - pos, "FFT Peaks: ");
+      // Memory monitoring every 5 seconds
+      uint32_t current_time = millis();
+      if (current_time - last_memory_check >= 5000) {
+        uint32_t current_heap = ESP.getFreeHeap();
+        int32_t heap_change = (int32_t)current_heap - (int32_t)initial_heap;
         
-        for (int i = 0; i < count; i++) {
-          // Convert bin index to frequency: freq = (bin * SAMPLE_RATE) / SAMPLES
-          float frequency = (float)(selected[i].index * SAMPLE_RATE) / SAMPLES;
-          pos += snprintf(log_buffer + pos, sizeof(log_buffer) - pos, 
-                         "[%.0fHz: %.2f] ", frequency, selected[i].magnitude);
-          
-          // Prevent buffer overflow
-          if (pos >= sizeof(log_buffer) - 20) break;
+        ESP_LOGI("fft", "MEMORY: Heap=%d, Change=%d, WS_clients=%d", 
+                 current_heap, heap_change, getWebSocketClientCount());
+        
+        last_memory_check = current_time;
+        
+        // WebSocket health monitoring
+        if (websocket_sends_attempted > 0) {
+          float success_rate = (float)(websocket_sends_attempted - websocket_sends_skipped) / websocket_sends_attempted * 100.0f;
+          ESP_LOGI("fft", "WebSocket: %d attempted, %d skipped, %.1f%% success", 
+                   websocket_sends_attempted, websocket_sends_skipped, success_rate);
         }
         
-        ESP_LOGI("fft", "%s", log_buffer);
-      }
-
-      // Step 10: Send peaks
-      step_start_time = esp_timer_get_time();
-      send_peaks(selected,current_num_highest);
-      step_end_time = esp_timer_get_time();
-      total_send_time_us += (step_end_time - step_start_time);
-      
-      // End timing and calculate performance metrics
-      uint32_t fft_end_time = esp_timer_get_time();
-      uint32_t fft_duration_us = fft_end_time - fft_start_time;
-      
-      // Update statistics
-      total_fft_time_us += fft_duration_us;
-      if (fft_duration_us > max_fft_time_us) {
-        max_fft_time_us = fft_duration_us;
-      }
-      if (fft_duration_us < min_fft_time_us) {
-        min_fft_time_us = fft_duration_us;
-      }
-      
-      // Report benchmark every 100 successful FFTs
-      if (successful_ffts % 100 == 0) {
-        uint32_t avg_fft_time_us = total_fft_time_us / successful_ffts;
-        float avg_fft_time_ms = avg_fft_time_us / 1000.0f;
-        float max_fft_time_ms = max_fft_time_us / 1000.0f;
-        float min_fft_time_ms = min_fft_time_us / 1000.0f;
-        float fft_rate_hz = 1000000.0f / avg_fft_time_us;
+        // Reset counters
+        websocket_sends_attempted = 0;
+        websocket_sends_skipped = 0;
         
-        ESP_LOGI("fft", "BENCHMARK #%d: Avg=%.2fms, Max=%.2fms, Min=%.2fms, Rate=%.1fHz", 
-                 successful_ffts, avg_fft_time_ms, max_fft_time_ms, min_fft_time_ms, fft_rate_hz);
-        
-        // Detailed step breakdown (average times in milliseconds)
-        float avg_mono_ms = (total_mono_time_us / successful_ffts) / 1000.0f;
-        float avg_windowing_ms = (total_windowing_time_us / successful_ffts) / 1000.0f;
-        float avg_compute_ms = (total_compute_time_us / successful_ffts) / 1000.0f;
-        float avg_magnitude_ms = (total_magnitude_time_us / successful_ffts) / 1000.0f;
-        float avg_peak_prep_ms = (total_peak_prep_time_us / successful_ffts) / 1000.0f;
-        float avg_peak_sort_ms = (total_peak_sort_time_us / successful_ffts) / 1000.0f;
-        float avg_peak_select_ms = (total_peak_select_time_us / successful_ffts) / 1000.0f;
-        float avg_normalize_ms = (total_normalize_time_us / successful_ffts) / 1000.0f;
-        float avg_final_sort_ms = (total_final_sort_time_us / successful_ffts) / 1000.0f;
-        float avg_send_ms = (total_send_time_us / successful_ffts) / 1000.0f;
-        
-        ESP_LOGI("fft", "STEP BREAKDOWN: Mono=%.2f Wind=%.2f Comp=%.2f Mag=%.2f Prep=%.2f Sort1=%.2f Sel=%.2f Norm=%.2f Sort2=%.2f Send=%.2f", 
-                 avg_mono_ms, avg_windowing_ms, avg_compute_ms, avg_magnitude_ms, 
-                 avg_peak_prep_ms, avg_peak_sort_ms, avg_peak_select_ms, 
-                 avg_normalize_ms, avg_final_sort_ms, avg_send_ms);
-        
-        // Expected rate for 44.1kHz audio with 512 samples is ~86Hz
-        if (fft_rate_hz < 50.0f) {
-          ESP_LOGW("fft", "WARNING: FFT rate %.1fHz is too slow for real-time processing!", fft_rate_hz);
+        // Memory leak warning
+        if (heap_change < -10000) {
+          ESP_LOGW("fft", "MEMORY LEAK: Heap dropped %d bytes", -heap_change);
         }
       }
       
     } else {
-      // Log periodically when no samples are available
-      if (loop_count % 1000 == 0) {
-        ESP_LOGW("fft", "Loop %d: No samples available for FFT processing", loop_count);
+      // Minimal logging when no samples available
+      uint32_t current_time = millis();
+      if (successful_ffts == 0 && current_time % 5000 < 100) {
+        ESP_LOGW("fft", "No BT samples available for FFT");
       }
     }
 
     vTaskDelay(pdMS_TO_TICKS(16));
   }
+  
+  // Cleanup WebSocket batch buffer
+  if (fft_batch) {
+    free_psram_fallback(fft_batch);
+  }
 }
 
 void fft_task_init() {
-  peaks_queue = xQueueCreate(MAX_LED_QUEUE, sizeof(peak_msg_t *));
+  ESP_LOGI("fft", "Initializing FFT task...");
+  
+  // Allocate FFT buffers in PSRAM first
+  if (!allocate_fft_buffers()) {
+    ESP_LOGE("fft", "Failed to allocate FFT buffers - FFT task initialization aborted");
+    return;
+  }
 
   config_mutex = xSemaphoreCreateMutex();
   if (!config_mutex) {
-    Serial.println("Config mutex creation failed");
+    ESP_LOGE("fft", "Config mutex creation failed");
+    deallocate_fft_buffers();
     return;
   }
 
@@ -424,6 +452,7 @@ void fft_task_init() {
   esp_err_t ret = dsps_fft2r_init_fc32(NULL, SAMPLES);
   if (ret != ESP_OK) {
     ESP_LOGE("fft", "ESP-DSP FFT initialization failed: %s", esp_err_to_name(ret));
+    deallocate_fft_buffers();
     return;
   }
   ESP_LOGI("fft", "ESP-DSP FFT initialized successfully for %d samples", SAMPLES);
@@ -436,6 +465,13 @@ void fft_task_init() {
   }
 
   xTaskCreate(fft_task, "fft_task", 8192, NULL, 5, NULL);
+  ESP_LOGI("fft", "FFT task initialized successfully with PSRAM buffers");
+}
+
+void fft_task_deinit() {
+  ESP_LOGI("fft", "Deinitializing FFT task...");
+  deallocate_fft_buffers();
+  ESP_LOGI("fft", "FFT task deinitialized");
 }
 
 // Thread-safe setters/getters

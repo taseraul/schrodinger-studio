@@ -80,9 +80,23 @@
     .fft-bin.active {
       opacity: 1;
     }
+    .connection-status {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 3px;
+      background: #f44336;
+      z-index: 1000;
+      transition: background-color 0.3s ease;
+    }
+    .connection-status.connected {
+      background: #4CAF50;
+    }
   </style>
 </head>
 <body>
+  <div class="connection-status" id="connectionStatus"></div>
   <div class="card">
     <div class="list" id="deviceList"></div>
     <div id="right" style="flex: 1; padding: 2rem; display: flex; flex-direction: column;">
@@ -99,10 +113,184 @@
   <script>
     const loc = window.location;
     const wsProtocol = loc.protocol === "https:" ? "wss" : "ws";
-    const socket = new WebSocket(`${wsProtocol}://${loc.hostname}/ws`);
     const list = document.getElementById("deviceList");
     const colorPicker = document.getElementById("colorPicker");
+    const connectionStatus = document.getElementById("connectionStatus");
     let currentColorEdit = null;
+    
+    // WebSocket connection management
+    let socket = null;
+    let reconnectInterval = 1000; // Start with 1 second
+    let maxReconnectInterval = 30000; // Max 30 seconds
+    let reconnectAttempts = 0;
+    let isConnected = false;
+    
+    function connectWebSocket() {
+      try {
+        socket = new WebSocket(`${wsProtocol}://${loc.hostname}/ws`);
+        
+        socket.onopen = () => {
+          console.log('WebSocket connected');
+          isConnected = true;
+          reconnectAttempts = 0;
+          reconnectInterval = 1000; // Reset interval on successful connection
+          
+          // Update UI to show connection status
+          connectionStatus.className = 'connection-status connected';
+        };
+
+        socket.onclose = (e) => {
+          isConnected = false;
+          console.warn(`WebSocket closed (code: ${e.code}, reason: ${e.reason}). Attempting reconnect...`);
+          
+          // Update UI to show disconnection
+          connectionStatus.className = 'connection-status';
+          
+          // Exponential backoff for reconnection
+          reconnectAttempts++;
+          const delay = Math.min(reconnectInterval * Math.pow(1.5, reconnectAttempts), maxReconnectInterval);
+          
+          console.log(`Reconnecting in ${delay}ms (attempt ${reconnectAttempts})`);
+          setTimeout(connectWebSocket, delay);
+        };
+
+        socket.onerror = (err) => {
+          console.error('WebSocket error:', err);
+          if (socket && socket.readyState === WebSocket.OPEN) {
+            socket.close(); // Trigger reconnect via onclose
+          }
+        };
+
+        socket.onmessage = handleWebSocketMessage;
+        socket.binaryType = 'arraybuffer'; // Enable binary data reception
+        
+      } catch (error) {
+        console.error('Failed to create WebSocket:', error);
+        setTimeout(connectWebSocket, reconnectInterval);
+      }
+    }
+    
+    function handleWebSocketMessage(event) {
+      // Check if this is binary data (FFT) or text data (device control)
+      if (event.data instanceof ArrayBuffer) {
+        handleBinaryFFTData(event.data);
+        return;
+      }
+      
+      // Handle text/JSON data for device control
+      const data = JSON.parse(event.data);
+      
+      // Handle FFT batch data (legacy JSON support)
+      if (data.frames) {
+        animateFFTFrames(data.frames);
+        return;
+      }
+      
+      // Handle single FFT data (legacy support)
+      if (data.f) {
+        updateFFT(data.f);
+        return;
+      }
+
+      // Handle device data
+      const { id } = data;
+      let existing = document.getElementById(`device-${id}`);
+
+      if (!existing) {
+        // Only create new card if we have a full data packet (check key presence)
+        const requiredFields = ['band', 'lock', 'flash', 'battery', 'red', 'green', 'blue'];
+        const hasAllFields = requiredFields.every(k => k in data);
+        if (!hasAllFields) return; // Ignore partial updates if no existing card
+
+        existing = document.createElement("div");
+        existing.className = "item";
+        existing.id = `device-${id}`;
+        existing.innerHTML = `
+          <span>${id}</span>
+          <select onchange="sendField(${id}, 'band', this.value)">
+            ${[0,1,2,3,4,5].map(n => `<option value="${n}">${n+1}</option>`).join('')}
+          </select>
+          <button class="icon-btn" onclick="toggleIcon(this, 'lock', ${id})">🔓</button>
+          <button class="icon-btn" onclick="toggleIcon(this, 'flash', ${id})">💡</button>
+          <span class="battery" id="battery-${id}"></span>
+          <div class="color-box" id="color-${id}" onclick="pickColor(${id})"></div>
+        `;
+        list.appendChild(existing);
+      }
+
+      // Update values
+      if (data.band !== undefined) existing.querySelector("select").value = data.band;
+      if (data.lock !== undefined) existing.querySelector(".icon-btn:nth-of-type(1)").textContent = data.lock ? '🔒' : '🔓';
+      if (data.flash !== undefined) existing.querySelector(".icon-btn:nth-of-type(2)").textContent = data.flash ? '💡' : '💤';
+      if (data.battery !== undefined) {
+        const batt = existing.querySelector(".battery");
+        batt.textContent = `${data.battery}%`;
+        batt.style.color = `rgb(${255 - data.battery * 2.55}, ${data.battery * 2.55}, 0)`;
+      }
+      if (data.red !== undefined && data.green !== undefined && data.blue !== undefined) {
+        existing.querySelector(".color-box").style.backgroundColor = `rgb(${data.red}, ${data.green}, ${data.blue})`;
+      }
+    }
+
+    // Binary FFT data handler - highly optimized protocol
+    function handleBinaryFFTData(arrayBuffer) {
+      const data = new Uint8Array(arrayBuffer);
+      
+      if (data.length < 1) {
+        console.warn('Invalid binary FFT data: too short');
+        return;
+      }
+      
+      // Parse binary protocol: [frame_count][frame1_data][frame2_data]...
+      // Each frame: [peak_count][bin1][mag1][bin2][mag2]...
+      const frameCount = data[0];
+      const frames = [];
+      
+      let offset = 1; // Skip frame count byte
+      
+      for (let f = 0; f < frameCount; f++) {
+        if (offset >= data.length) {
+          console.warn(`Binary FFT data truncated at frame ${f}`);
+          break;
+        }
+        
+        const peakCount = data[offset++];
+        const frameData = [];
+        
+        // Read peak data: bin (uint8), magnitude (uint8 scaled to 0-1)
+        for (let p = 0; p < peakCount; p++) {
+          if (offset + 1 >= data.length) {
+            console.warn(`Binary FFT data truncated at peak ${p} of frame ${f}`);
+            break;
+          }
+          
+          const binIndex = data[offset++];
+          const magnitude = data[offset++] / 255.0; // Convert back to 0-1 range
+          
+          frameData.push(binIndex, magnitude);
+        }
+        
+        frames.push(frameData);
+      }
+      
+      // Log compression efficiency
+      if (!handleBinaryFFTData.packetCount) {
+        handleBinaryFFTData.packetCount = 0;
+      }
+      handleBinaryFFTData.packetCount++;
+      
+      if (handleBinaryFFTData.packetCount % 50 === 0) {
+        const jsonSize = JSON.stringify({frames}).length;
+        const binarySize = data.length;
+        const compression = ((jsonSize - binarySize) / jsonSize * 100).toFixed(1);
+        console.log(`Binary FFT #${handleBinaryFFTData.packetCount}: ${binarySize} bytes vs ${jsonSize} JSON bytes (${compression}% smaller)`);
+      }
+      
+      // Animate the frames
+      if (frames.length > 0) {
+        animateFFTFrames(frames);
+      }
+    }
 
     // FFT visualization variables
     const MAX_BINS = 116; // Based on MAX_BIN calculation: (10000 * 512) / 44100 ≈ 116
@@ -221,77 +409,12 @@
       }
     }
 
-    socket.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      
-      // Handle FFT batch data
-      if (data.frames) {
-        animateFFTFrames(data.frames);
-        return;
-      }
-      
-      // Handle single FFT data (legacy support)
-      if (data.f) {
-        updateFFT(data.f);
-        return;
-      }
-
-      // Handle device data
-      const { id } = data;
-      let existing = document.getElementById(`device-${id}`);
-
-      if (!existing) {
-        // Only create new card if we have a full data packet (check key presence)
-        const requiredFields = ['band', 'lock', 'flash', 'battery', 'red', 'green', 'blue'];
-        const hasAllFields = requiredFields.every(k => k in data);
-        if (!hasAllFields) return; // Ignore partial updates if no existing card
-
-        existing = document.createElement("div");
-        existing.className = "item";
-        existing.id = `device-${id}`;
-        existing.innerHTML = `
-          <span>${id}</span>
-          <select onchange="sendField(${id}, 'band', this.value)">
-            ${[0,1,2,3,4,5].map(n => `<option value="${n}">${n+1}</option>`).join('')}
-          </select>
-          <button class="icon-btn" onclick="toggleIcon(this, 'lock', ${id})">🔓</button>
-          <button class="icon-btn" onclick="toggleIcon(this, 'flash', ${id})">💡</button>
-          <span class="battery" id="battery-${id}"></span>
-          <div class="color-box" id="color-${id}" onclick="pickColor(${id})"></div>
-        `;
-        list.appendChild(existing);
-      }
-
-      // Update values
-      if (data.band !== undefined) existing.querySelector("select").value = data.band;
-      if (data.lock !== undefined) existing.querySelector(".icon-btn:nth-of-type(1)").textContent = data.lock ? '🔒' : '🔓';
-      if (data.flash !== undefined) existing.querySelector(".icon-btn:nth-of-type(2)").textContent = data.flash ? '💡' : '💤';
-      if (data.battery !== undefined) {
-        const batt = existing.querySelector(".battery");
-        batt.textContent = `${data.battery}%`;
-        batt.style.color = `rgb(${255 - data.battery * 2.55}, ${data.battery * 2.55}, 0)`;
-      }
-      if (data.red !== undefined && data.green !== undefined && data.blue !== undefined) {
-        existing.querySelector(".color-box").style.backgroundColor = `rgb(${data.red}, ${data.green}, ${data.blue})`;
-      }
-    };
-
-    socket.onopen = () => {
-      console.log('WebSocket connected');
-    };
-
-    socket.onclose = (e) => {
-      console.warn('WebSocket closed. Reconnecting in 1s...', e.reason);
-      setTimeout(connectWebSocket, reconnectInterval);
-    };
-
-    socket.onerror = (err) => {
-      console.error('WebSocket error', err);
-      ws.close(); // Trigger reconnect via onclose
-    };
-
     function sendField(id, field, value) {
-      socket.send(JSON.stringify({ id, [field]: value }));
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ id, [field]: value }));
+      } else {
+        console.warn('WebSocket not connected, cannot send data');
+      }
     }
 
     function toggleIcon(el, field, id) {
@@ -362,7 +485,9 @@
       // Set saturation to 100%, convert back
       [r, g, b] = hslToRgb(h, 1, 0.5);
 
-      socket.send(JSON.stringify({ id: currentColorEdit, red: r, green: g, blue: b }));
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ id: currentColorEdit, red: r, green: g, blue: b }));
+      }
     });
 
     // Handle window resize to recalculate bin widths
@@ -372,16 +497,17 @@
       }
     });
 
-    // Initialize FFT display when page loads
-    document.addEventListener('DOMContentLoaded', () => {
+    // Initialize everything when page loads
+    function initialize() {
       initFFTDisplay();
-    });
+      connectWebSocket();
+    }
 
-    // Also initialize immediately in case DOMContentLoaded already fired
+    // Initialize when DOM is ready
     if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', initFFTDisplay);
+      document.addEventListener('DOMContentLoaded', initialize);
     } else {
-      initFFTDisplay();
+      initialize();
     }
   </script>
 </body>
