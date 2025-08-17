@@ -2,14 +2,13 @@
 #include "ESPAsyncWebServer.h"
 #include "AsyncTCP.h"
 #include "webserver.hpp"
-#include "fft.hpp"
+#include "../processing/fft_processor.hpp"
 #include "SPIFFS.h"
 #include "esp_log.h"
 #include "Arduino_JSON.h"
-#include "now.hpp"
+#include "espnow_manager.hpp"
 #include "esp_heap_caps.h"
-#include "bt_monitor.hpp"
-#include "memory_manager.hpp"
+#include "../core/memory_utils.hpp"
 #include <map>
 #include <set>
 
@@ -91,25 +90,28 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
   if (json.hasOwnProperty("band")) {
     int band = (int)json["band"];
     ESP_LOGI(TAG, "Set band to %d for id %d", band, id);
-    setBand(band, id);
+    // TODO: Integrate with ESP-NOW manager for device control
+    // ESPNOW_MGR.setBand(band, id);
   }
 
   if (json.hasOwnProperty("lock")) {
     bool lock = (bool)json["lock"];
     ESP_LOGI(TAG, "Set lock to %s for id %d", lock ? "true" : "false", id);
-    // stub: updateLock(id, lock);
+    // TODO: Implement lock functionality
   }
 
   if (json.hasOwnProperty("flash")) {
     bool flash = (bool)json["flash"];
     ESP_LOGI(TAG, "Set flash to %s for id %d", flash ? "true" : "false", id);
-    setFlash(flash, id);
+    // TODO: Integrate with ESP-NOW manager for device control
+    // ESPNOW_MGR.setFlash(flash, id);
   }
 
   if (json.hasOwnProperty("red") && json.hasOwnProperty("green") && json.hasOwnProperty("blue")) {
     const uint8_t rgb[3] = {(uint8_t)json["red"], (uint8_t)json["green"], (uint8_t)json["blue"]};
     ESP_LOGI(TAG, "Set color RGB(%d, %d, %d) for id %d", rgb[0], rgb[1], rgb[2], id);
-    setColor(rgb,id);
+    // TODO: Integrate with ESP-NOW manager for device control
+    // ESPNOW_MGR.setColor(rgb, id);
   }
 
   // Echo back the packet to all clients
@@ -465,51 +467,30 @@ void webserver_init() {
     // Use minimal memory for status response
     char json[256];
     snprintf(json, sizeof(json), 
-      "{\"heap\":%d,\"psram\":%d,\"wifi_connected\":%s,\"wifi_rssi\":%d,\"bt_state\":%d,\"bt_audio_active\":%s,\"uptime\":%lu}",
+      "{\"heap\":%d,\"psram\":%d,\"wifi_connected\":%s,\"wifi_rssi\":%d,\"uptime\":%lu}",
       ESP.getFreeHeap(), ESP.getFreePsram(),
       WiFi.status() == WL_CONNECTED ? "true" : "false",
-      WiFi.RSSI(), get_bt_state(),
-      is_bt_audio_active() ? "true" : "false",
+      WiFi.RSSI(),
       millis()
     );
     request->send(200, "application/json", json);
   });
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    // Check memory health before serving files
-    if (!check_memory_health()) {
-      ESP_LOGW(TAG, "Memory health check failed before serving file");
-      
-      // Try to recover memory
-      force_garbage_collection();
-      
-      // Check again after cleanup
-      if (!check_memory_health()) {
-        char errorMsg[128];
-        snprintf(errorMsg, sizeof(errorMsg), 
-          "Service temporarily unavailable - insufficient memory (%d bytes free)", 
-          ESP.getFreeHeap());
-        request->send(503, "text/plain", errorMsg);
-        return;
-      }
-    }
-    
-    // Additional check for largest free block to ensure we can handle the file
-    size_t largestBlock = get_largest_free_block();
-    if (largestBlock < 8192) {  // Need at least 8KB contiguous for file serving
-      ESP_LOGW(TAG, "Insufficient contiguous memory: %d bytes largest block", largestBlock);
-      force_garbage_collection();
-      
-      largestBlock = get_largest_free_block();
-      if (largestBlock < 8192) {
-        request->send(503, "text/plain", "Service temporarily unavailable - memory fragmentation");
-        return;
-      }
+    // Simple memory check before serving files
+    uint32_t free_heap = ESP.getFreeHeap();
+    if (free_heap < 10000) {  // Need at least 10KB for file serving
+      ESP_LOGW(TAG, "Low memory (%d bytes), cannot serve file", free_heap);
+      char errorMsg[128];
+      snprintf(errorMsg, sizeof(errorMsg), 
+        "Service temporarily unavailable - insufficient memory (%d bytes free)", 
+        free_heap);
+      request->send(503, "text/plain", errorMsg);
+      return;
     }
     
     // Log memory usage for debugging
-    ESP_LOGI(TAG, "Serving main page with %d bytes heap free, %d largest block", 
-             ESP.getFreeHeap(), largestBlock);
+    ESP_LOGI(TAG, "Serving main page with %d bytes heap free", free_heap);
     request->send(SPIFFS,"/client.html" ,"text/html");
   });
 

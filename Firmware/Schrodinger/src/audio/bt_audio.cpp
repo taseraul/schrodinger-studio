@@ -1,15 +1,15 @@
-#include "bt.hpp"
+#include "bt_audio.hpp"
 #include "AudioTools.h"
 #include "BluetoothA2DPSink.h"
-#include "config.hpp"
+#include "../core/logger.hpp"
+#include "../core/config_manager.hpp"
+#include "../core/system_manager.hpp"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-#include "bt_monitor.hpp"
-#include "esp_log.h"
+#include "../core/memory_utils.hpp"
 #include "circular_buffer.hpp"
-
-static const char* TAG = "bt";
+#include "WiFi.h"
 
 NumberFormatConverterStream scaledBt;
 BluetoothA2DPSink a2dp_sink(scaledBt);
@@ -30,18 +30,17 @@ void receiveBtSamples(const uint8_t* data, uint32_t length)
   callback_count++;
   
   if (!bt_circular_buffer || !data || length == 0) {
-    ESP_LOGW(TAG, "BT callback %d: Invalid params - buffer:%p data:%p length:%d", 
-             callback_count, bt_circular_buffer, data, length);
+    LOG_AUDIO_W("BT callback %d: Invalid params - buffer:%p data:%p length:%d", 
+                callback_count, bt_circular_buffer, data, length);
     return;
   }
   
   // Log first few callbacks and then periodically
   if (callback_count <= 5 || callback_count % 100 == 0) {
-    ESP_LOGI(TAG, "BT callback %d: Received %d bytes", callback_count, length);
+    LOG_AUDIO_I("BT callback %d: Received %d bytes", callback_count, length);
   }
   
-  // Update BT state to indicate audio is playing
-  bt_state_changed(BT_AUDIO_PLAYING);
+  // Audio is playing (bt_monitor functionality removed)
   
   // Write samples to circular buffer (converts 16-bit to 32-bit internally)
   if (bt_circular_buffer->write_samples_16bit(data, length)) {
@@ -49,13 +48,13 @@ void receiveBtSamples(const uint8_t* data, uint32_t length)
     
     // Log periodically for debugging (every 1000 sample pairs)
     if (total_samples_received % 1000 == 0) {
-      ESP_LOGI(TAG, "BT samples: %d pairs, buffer: %.1f%%, available: %d pairs", 
-               total_samples_received, bt_circular_buffer->get_utilization(),
-               bt_circular_buffer->get_sample_count());
+      LOG_AUDIO_I("BT samples: %d pairs, buffer: %.1f%%, available: %d pairs", 
+                  total_samples_received, bt_circular_buffer->get_utilization(),
+                  bt_circular_buffer->get_sample_count());
     }
   } else {
     buffer_overflow_count++;
-    ESP_LOGW(TAG, "BT buffer write failed %d times", buffer_overflow_count);
+    LOG_AUDIO_W("BT buffer write failed %d times", buffer_overflow_count);
   }
 }
 
@@ -63,9 +62,12 @@ bool readBtSamples(uint32_t* dest, size_t length) {
   static uint32_t read_attempts = 0;
   read_attempts++;
   
-  if (!bt_circular_buffer || !dest || length < SAMPLES * 2) {
-    ESP_LOGW(TAG, "Read attempt %d: Invalid params - buffer:%p dest:%p length:%d", 
-             read_attempts, bt_circular_buffer, dest, length);
+  const auto& config = CONFIG_MGR.getAudioConfig();
+  uint16_t samples_needed = config.samples;
+  
+  if (!bt_circular_buffer || !dest || length < samples_needed * 2) {
+    LOG_AUDIO_W("Read attempt %d: Invalid params - buffer:%p dest:%p length:%d", 
+                read_attempts, bt_circular_buffer, dest, length);
     return false;
   }
 
@@ -73,58 +75,41 @@ bool readBtSamples(uint32_t* dest, size_t length) {
   
   // Log first few attempts and then periodically
   if (read_attempts <= 10 || read_attempts % 100 == 0) {
-    ESP_LOGI(TAG, "Read attempt %d: Available samples: %d, need: %d", 
-             read_attempts, available_samples, SAMPLES);
+    LOG_AUDIO_I("Read attempt %d: Available samples: %d, need: %d", 
+                read_attempts, available_samples, samples_needed);
   }
 
-  // Read exactly SAMPLES sample pairs from circular buffer
-  bool success = bt_circular_buffer->read_samples_32bit(dest, SAMPLES);
+  // Read exactly samples_needed sample pairs from circular buffer
+  bool success = bt_circular_buffer->read_samples_32bit(dest, samples_needed);
   
   if (success && (read_attempts <= 10 || read_attempts % 100 == 0)) {
-    ESP_LOGI(TAG, "Read attempt %d: SUCCESS - Read %d sample pairs", read_attempts, SAMPLES);
+    LOG_AUDIO_I("Read attempt %d: SUCCESS - Read %d sample pairs", read_attempts, samples_needed);
   } else if (!success && read_attempts % 50 == 0) {
-    ESP_LOGW(TAG, "Read attempt %d: FAILED - Not enough samples (have: %d, need: %d)", 
-             read_attempts, available_samples, SAMPLES);
+    LOG_AUDIO_W("Read attempt %d: FAILED - Not enough samples (have: %d, need: %d)", 
+                read_attempts, available_samples, samples_needed);
   }
   
   return success;
 }
 
-// // High-priority task: reads samples from BT
-// void bt_task(void *param) {
-//   size_t bytes_read;
-//   uint8_t temp_buffer[SAMPLES * 8];  // 2 channels × 4 bytes = 8 bytes/sample pair
-
-//   while (true) {
-//     size_t res = scaledBt.readBytes(temp_buffer, sizeof(temp_buffer));
-
-//     if (res == sizeof(temp_buffer)) {
-//       if (xSemaphoreTake(buffer_mutex, 0)) {
-//         memcpy(samples, temp_buffer, sizeof(temp_buffer));
-//         buffer_ready = true;
-//         xSemaphoreGive(buffer_mutex);
-//         ESP_LOGI("bt","Samples read");
-//       }
-//     }
-
-//     vTaskDelay(pdMS_TO_TICKS(2));
-//   }
-// }
-
 void bt_init() {
-  ESP_LOGI(TAG, "Initializing Bluetooth A2DP Sink...");
+  LOG_AUDIO_I("Initializing Bluetooth A2DP Sink...");
+  SYSTEM_MGR.setSubsystemStatus(SUBSYSTEM_AUDIO, SUBSYSTEM_STATUS_INITIALIZING);
+  
+  // Get configuration
+  const auto& config = CONFIG_MGR.getNetworkConfig();
   
   // Print memory before BT init
   uint32_t heapBefore = ESP.getFreeHeap();
-  ESP_LOGI(TAG, "Free heap before BT init: %d bytes", heapBefore);
+  log_memory_status("BT Init Start");
   
   // Check if we have enough memory to initialize Bluetooth
   if (heapBefore < 80000) {
-    ESP_LOGW(TAG, "Low memory before BT init (%d bytes). BT may fail.", heapBefore);
+    LOG_AUDIO_W("Low memory before BT init (%d bytes). BT may fail.", heapBefore);
   }
   
   // CRITICAL: Temporarily disable WiFi to avoid coexistence conflicts during BT init
-  ESP_LOGI(TAG, "Temporarily disabling WiFi for BT initialization...");
+  LOG_AUDIO_I("Temporarily disabling WiFi for BT initialization...");
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   delay(500);  // Allow WiFi to fully shut down
@@ -132,14 +117,15 @@ void bt_init() {
   // Initialize circular buffer for BT samples (16KB in PSRAM)
   bt_circular_buffer = new CircularBuffer(16384);  // 16KB
   if (!bt_circular_buffer || !bt_circular_buffer->init()) {
-    ESP_LOGE(TAG, "Failed to initialize BT circular buffer");
+    LOG_AUDIO_E("Failed to initialize BT circular buffer");
     if (bt_circular_buffer) {
       delete bt_circular_buffer;
       bt_circular_buffer = nullptr;
     }
+    SYSTEM_MGR.setSubsystemStatus(SUBSYSTEM_AUDIO, SUBSYSTEM_STATUS_ERROR);
     return;
   }
-  ESP_LOGI(TAG, "BT circular buffer initialized successfully");
+  LOG_AUDIO_I("BT circular buffer initialized successfully");
   
   // Configure I2S settings BEFORE starting A2DP to prevent conflicts
   // Use different pins than the existing I2S RX configuration
@@ -173,43 +159,47 @@ void bt_init() {
   // Configure A2DP with optimized settings for memory usage
   a2dp_sink.set_auto_reconnect(false); // Disable auto-reconnect to save resources
   
-  ESP_LOGI(TAG, "Starting A2DP sink with name: Schrodinger2");
+  LOG_AUDIO_I("Starting A2DP sink with name: %s", config.bt_device_name);
   
   // Monitor memory during BT start
   uint32_t heapDuringStart = ESP.getFreeHeap();
-  ESP_LOGI(TAG, "Heap during BT start: %d bytes", heapDuringStart);
+  LOG_AUDIO_D("Heap during BT start: %d bytes", heapDuringStart);
   
   // Start the A2DP sink with error handling
   try {
-    a2dp_sink.start("Schrodinger2");
-    ESP_LOGI(TAG, "A2DP sink started successfully");
+    a2dp_sink.start(config.bt_device_name);
+    LOG_AUDIO_I("A2DP sink started successfully");
   } catch (const std::exception& e) {
-    ESP_LOGE(TAG, "A2DP sink start failed: %s", e.what());
+    log_error_with_context(LOG_TAG_AUDIO, "A2DP sink start failed", e.what());
+    SYSTEM_MGR.setSubsystemStatus(SUBSYSTEM_AUDIO, SUBSYSTEM_STATUS_ERROR);
     return;
   } catch (...) {
-    ESP_LOGE(TAG, "A2DP sink start failed with unknown exception");
+    log_error_with_context(LOG_TAG_AUDIO, "A2DP sink start failed", "Unknown exception");
+    SYSTEM_MGR.setSubsystemStatus(SUBSYSTEM_AUDIO, SUBSYSTEM_STATUS_ERROR);
     return;
   }
   
   // Print memory after BT init
   uint32_t heapAfter = ESP.getFreeHeap();
-  ESP_LOGI(TAG, "Free heap after BT init: %d bytes", heapAfter);
-  ESP_LOGI(TAG, "BT initialization consumed: %d bytes", heapBefore - heapAfter);
+  log_memory_status("BT Init Complete");
+  log_performance_metric("BT Initialization", millis() - heapBefore);
   
   if (heapAfter < 30000) {
-    ESP_LOGW(TAG, "Very low memory after BT init. System may be unstable.");
+    LOG_AUDIO_W("Very low memory after BT init. System may be unstable.");
   }
   
   // Re-enable WiFi after successful BT initialization
-  ESP_LOGI(TAG, "Re-enabling WiFi after BT initialization...");
+  LOG_AUDIO_I("Re-enabling WiFi after BT initialization...");
   WiFi.mode(WIFI_AP_STA);
   delay(500);  // Allow WiFi to initialize
   
-  ESP_LOGI(TAG, "Bluetooth A2DP Sink initialized successfully");
+  SYSTEM_MGR.setSubsystemStatus(SUBSYSTEM_AUDIO, SUBSYSTEM_STATUS_RUNNING);
+  LOG_AUDIO_I("Bluetooth A2DP Sink initialized successfully");
 }
 
 void bt_deinit() {
-  ESP_LOGI(TAG, "Deinitializing Bluetooth A2DP Sink...");
+  LOG_AUDIO_I("Deinitializing Bluetooth A2DP Sink...");
+  SYSTEM_MGR.setSubsystemStatus(SUBSYSTEM_AUDIO, SUBSYSTEM_STATUS_SHUTDOWN);
   
   // Stop A2DP sink
   a2dp_sink.end();
@@ -219,34 +209,37 @@ void bt_deinit() {
     bt_circular_buffer->deinit();
     delete bt_circular_buffer;
     bt_circular_buffer = nullptr;
-    ESP_LOGI(TAG, "BT circular buffer cleaned up");
+    LOG_AUDIO_I("BT circular buffer cleaned up");
   }
   
   // Reset counters
   total_samples_received = 0;
   buffer_overflow_count = 0;
   
-  ESP_LOGI(TAG, "Bluetooth A2DP Sink deinitialized");
+  LOG_AUDIO_I("Bluetooth A2DP Sink deinitialized");
 }
 
 // Function to re-initialize WiFi connection after BT is started
 void bt_post_init_wifi_restore() {
-  ESP_LOGI(TAG, "Restoring WiFi connection after BT initialization...");
+  LOG_AUDIO_I("Restoring WiFi connection after BT initialization...");
+  
+  // Get WiFi credentials from config
+  const auto& config = CONFIG_MGR.getNetworkConfig();
   
   // Re-establish WiFi connection
-  WiFi.begin("Raul", "armaghedon");
+  WiFi.begin(config.wifi_ssid, config.wifi_password);
   
   // Wait for connection with timeout
   int retryCount = 10;
   while (WiFi.status() != WL_CONNECTED && retryCount--) {
     delay(1000);
-    ESP_LOGI(TAG, "Reconnecting to WiFi... (%d attempts left)", retryCount);
+    LOG_AUDIO_D("Reconnecting to WiFi... (%d attempts left)", retryCount);
   }
   
   if (WiFi.status() != WL_CONNECTED) {
-    ESP_LOGW(TAG, "Failed to reconnect to WiFi, starting AP mode");
-    WiFi.softAP("Schrodinger");
+    LOG_AUDIO_W("Failed to reconnect to WiFi, starting AP mode");
+    WiFi.softAP(config.ap_ssid);
   } else {
-    ESP_LOGI(TAG, "WiFi reconnected successfully");
+    LOG_AUDIO_I("WiFi reconnected successfully");
   }
 }
