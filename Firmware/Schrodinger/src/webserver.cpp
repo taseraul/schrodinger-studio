@@ -4,7 +4,6 @@
 #include "webserver.hpp"
 #include "fft.hpp"
 #include "SPIFFS.h"
-#include "AsyncOTA.h"
 #include "esp_log.h"
 #include "Arduino_JSON.h"
 #include "now.hpp"
@@ -527,9 +526,6 @@ void webserver_init() {
     ESP_LOGW(TAG, "404 - File not found: %s", request->url().c_str());
     request->send(404, "text/plain", "File not found");
   });
-
-  // Disable OTA temporarily to save memory - can be re-enabled later if needed
-  // AsyncOTA.begin(&server); // Start ElegantOTA
 
   server.begin();
   
