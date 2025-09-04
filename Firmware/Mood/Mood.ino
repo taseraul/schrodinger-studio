@@ -7,6 +7,7 @@
 // #include <WebSerial.h>
 #include "driver/adc.h"
 #include <esp_bt.h>
+#include "..\packet.h"
 
 AsyncWebServer server(80);
 
@@ -20,51 +21,7 @@ AsyncWebServer server(80);
 
 #define NUM_BANDS 6
 
-#define DATA_PACKET 0x00u
-#define PAIR_PACKET 0x01u
-#define CONF_PACKET 0x02u
-#define UPDATE_PACKET 0x03u
-
-#define UPDATE_BATTERY 0x00u
-#define UPDATE_FLASH 0x01u
-#define UPDATE_LOCK 0x02u
-#define UPDATE_BAND 0x03u
-#define UPDATE_COLOR 0x04u
-#define UPDATE_FULL 0x05u
-
 #define MAX_CHANNEL 13 /* for EU | 11 for USA */
-#define PREAMBLE 0xAAu
-
-typedef struct struct_config {
-  uint8_t preamble;
-  uint8_t msgType;
-  uint8_t channel;
-  uint8_t setId;
-  uint8_t band;
-  uint8_t flash;
-  uint8_t rgb[3];
-} struct_config;
-
-typedef struct struct_message {
-  uint8_t preamble;
-  uint8_t msgType;
-  uint8_t bands[NUM_BANDS];
-} struct_message;
-
-
-typedef struct struct_pairing {
-  uint8_t preamble;
-  uint8_t msgType;
-  uint8_t battery;
-} struct_pairing;
-
-typedef struct struct_update {
-  uint8_t preamble;
-  uint8_t msgType;
-  uint8_t sourceId;
-  uint8_t updateType;
-  uint8_t updateData;
-} struct_update;
 
 struct_config deviceConfig;
 struct_message lightData;
@@ -85,7 +42,7 @@ uint64_t autoUpdateDebounce = 0;
 bool isFlashlight = false;
 bool auto_update = true;
 
-void OnDataRecv(const esp_now_recv_info *mac, const uint8_t *incomingData, int len) {
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
   static uint64_t timer = 0;
   uint8_t red;
   uint8_t green;
@@ -104,7 +61,7 @@ void OnDataRecv(const esp_now_recv_info *mac, const uint8_t *incomingData, int l
         if (esp_now_init() != ESP_OK) {
           Serial.println("Error initializing ESP-NOW");
         }
-        memcpy(serverAddress, mac, 6);
+        memcpy(serverAddress, info->src_addr, 6);
         addPeer(serverAddress, deviceConfig.channel);
         esp_now_register_send_cb(OnDataSent);
         esp_now_register_recv_cb(OnDataRecv);
@@ -113,19 +70,19 @@ void OnDataRecv(const esp_now_recv_info *mac, const uint8_t *incomingData, int l
       case DATA_PACKET:
         if (auto_pair()) {
           memcpy(&lightData, incomingData, sizeof(lightData));
-          if (memcmp(mac, serverAddress, 6) == 0) {
-            red = (uint32_t)deviceConfig.rgb[0] * lightData.bands[deviceConfig.band] / 255;
-            green = (uint32_t)deviceConfig.rgb[1] * lightData.bands[deviceConfig.band] / 255;
-            blue = (uint32_t)deviceConfig.rgb[2] * lightData.bands[deviceConfig.band] / 255;
+          if (memcmp(info->src_addr, serverAddress, 6) == 0) {
+            red = (uint32_t)deviceConfig.rgb[0] * lightData.data[deviceConfig.band] / 255;
+            green = (uint32_t)deviceConfig.rgb[1] * lightData.data[deviceConfig.band] / 255;
+            blue = (uint32_t)deviceConfig.rgb[2] * lightData.data[deviceConfig.band] / 255;
 
             Serial.println("FPS : ");
             Serial.println(1000.0 / (millis() - timer));
             timer = millis();
 
             if (!isFlashlight && auto_update) {
-              ledcWrite(0, 255 - red);
-              ledcWrite(1, 255 - green);
-              ledcWrite(2, 255 - blue);
+              ledcWrite(RED, 255 - red);
+              ledcWrite(GREEN, 255 - green);
+              ledcWrite(BLUE, 255 - blue);
             }
           }
         }
@@ -134,7 +91,7 @@ void OnDataRecv(const esp_now_recv_info *mac, const uint8_t *incomingData, int l
   }
 }
 
-void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+void OnDataSent(const esp_now_send_info_t *tx_info, esp_now_send_status_t status) {
   Serial.print("\r\nLast Packet Send Status:\t");
   Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
 }
@@ -145,6 +102,7 @@ void setup() {
   analogSetAttenuation(ADC_11db);
   Serial.begin(115200);
   delay(1000);
+  Serial.println("start");
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   WiFi.softAPdisconnect();
@@ -162,19 +120,15 @@ void setup() {
   esp_wifi_get_max_tx_power(&pwr);
   Serial.print(pwr);
 
-  ledcSetup(0, 20000, 8);
-  ledcSetup(1, 20000, 8);
-  ledcSetup(2, 20000, 8);
-
-  ledcAttachPin(RED, 0);
-  ledcAttachPin(GREEN, 1);
-  ledcAttachPin(BLUE, 2);
+  ledcAttach(RED, 20000, 8);
+  ledcAttach(GREEN, 20000, 8);
+  ledcAttach(BLUE, 20000, 8);
 
   delay(1000);
 
-  ledcWrite(0, 255);
-  ledcWrite(1, 255);
-  ledcWrite(2, 255);
+  ledcWrite(RED, 255);
+  ledcWrite(GREEN, 255);
+  ledcWrite(BLUE, 255);
 
   deviceConfig.channel = 1;
 
@@ -310,13 +264,13 @@ void toggleFlashLight() {
   update.updateData = isFlashlight;
 
   if (isFlashlight) {
-    ledcWrite(0, 0);
-    ledcWrite(1, 0);
-    ledcWrite(2, 0);
+    ledcWrite(RED, 0);
+    ledcWrite(GREEN, 0);
+    ledcWrite(BLUE, 0);
   } else {
-    ledcWrite(0, 255);
-    ledcWrite(1, 255);
-    ledcWrite(2, 255);
+    ledcWrite(RED, 255);
+    ledcWrite(GREEN, 255);
+    ledcWrite(BLUE, 255);
   }
 
   esp_now_send(serverAddress, (uint8_t *)&update, sizeof(update));
@@ -325,9 +279,9 @@ void toggleFlashLight() {
 void turnOff() {
   // Serial.println("OFF");
   // isFlashlight = true;
-  // ledcWrite(0, 252);
-  // ledcWrite(1, 252);
-  // ledcWrite(2, 252);
+  // ledcWrite(RED, 252);
+  // ledcWrite(GREEN, 252);
+  // ledcWrite(BLUE, 252);
   // delay(2000);
   // gpio_deep_sleep_hold_dis();
   // esp_sleep_config_gpio_isolate();
@@ -339,9 +293,9 @@ void turnOff() {
   // esp_sleep_pd_config(ESP_PD_DOMAIN_RTC8M, ESP_PD_OPTION_OFF);
   // esp_sleep_pd_config(ESP_PD_DOMAIN_VDDSDIO, ESP_PD_OPTION_OFF);
   // esp_deep_sleep_enable_gpio_wakeup(0b1100, ESP_GPIO_WAKEUP_GPIO_LOW);
-  // ledcWrite(0, 255);
-  // ledcWrite(1, 255);
-  // ledcWrite(2, 255);
+  // ledcWrite(RED, 255);
+  // ledcWrite(GREEN, 255);
+  // ledcWrite(BLUE, 255);
   // WiFi.mode(WIFI_OFF);
   // esp_wifi_stop();
   // esp_bt_controller_disable();
@@ -352,9 +306,9 @@ void turnOff() {
 
 void displayColor(uint8_t red, uint8_t green, uint8_t blue) {
   if (!isFlashlight) {
-    ledcWrite(0, 255 - red);
-    ledcWrite(1, 255 - green);
-    ledcWrite(2, 255 - blue);
+    ledcWrite(RED, 255 - red);
+    ledcWrite(GREEN, 255 - green);
+    ledcWrite(BLUE, 255 - blue);
     auto_update = false;
     autoUpdateDebounce = millis();
   }

@@ -12,6 +12,7 @@
 #include "webserver.hpp"
 #include "memory_manager.hpp"
 #include "Arduino.h"
+#include "driver/i2s.h"
 
 // #define READ_SAMPLES read_all_samples
 #define READ_SAMPLES readBtSamples
@@ -227,8 +228,13 @@ static void fft_task(void *param) {
   uint32_t websocket_sends_attempted = 0;
   uint32_t websocket_sends_skipped = 0;
   
+  size_t bytesRead;
+
   while (true) {
-    if (READ_SAMPLES(samples_copy, SAMPLES * 2)) {
+    // if (READ_SAMPLES(samples_copy, SAMPLES * 2)) {
+    // if (false){
+    if (i2s_read(I2S_NUM_0, samples_copy, SAMPLES * 2, &bytesRead, portMAX_DELAY) == ESP_OK) {
+      // ESP_LOGI("fft", "FFT : Processing samples");
       successful_ffts++;
       
       // Minimal logging for first few FFTs
@@ -301,91 +307,91 @@ static void fft_task(void *param) {
       sort_peaks_by_index(selected,current_num_highest);
 
       // Binary WebSocket protocol - highly optimized
-      if (count > 0) {
-        // Binary format: [frame_count][frame1_data][frame2_data]...
-        // Each frame: [peak_count][bin1][mag1][bin2][mag2]...
-        // bin: uint8_t (0-115), mag: uint8_t (0-255 scaled)
+      // if (count > 0) {
+      //   // Binary format: [frame_count][frame1_data][frame2_data]...
+      //   // Each frame: [peak_count][bin1][mag1][bin2][mag2]...
+      //   // bin: uint8_t (0-115), mag: uint8_t (0-255 scaled)
         
-        // Calculate required buffer size for this frame
-        size_t frame_size = 1 + (count * 2); // 1 byte count + 2 bytes per peak
+      //   // Calculate required buffer size for this frame
+      //   size_t frame_size = 1 + (count * 2); // 1 byte count + 2 bytes per peak
         
-        // Check if we have space in batch buffer
-        if (batch_count == 0) {
-          // First frame - write frame count placeholder and first frame
-          fft_batch[0] = 1; // Will be updated when batch is complete
-          fft_batch[1] = (uint8_t)count; // Peak count for this frame
+      //   // Check if we have space in batch buffer
+      //   if (batch_count == 0) {
+      //     // First frame - write frame count placeholder and first frame
+      //     fft_batch[0] = 1; // Will be updated when batch is complete
+      //     fft_batch[1] = (uint8_t)count; // Peak count for this frame
           
-          // Write peak data
-          for (int i = 0; i < count; i++) {
-            fft_batch[2 + i * 2] = (uint8_t)selected[i].index; // Bin index (0-115)
-            fft_batch[3 + i * 2] = (uint8_t)(selected[i].magnitude * 255.0f); // Magnitude (0-255)
-          }
-          batch_count = 1;
-        } else {
-          // Additional frame - append to batch
-          size_t current_batch_size = 1; // Frame count byte
+      //     // Write peak data
+      //     for (int i = 0; i < count; i++) {
+      //       fft_batch[2 + i * 2] = (uint8_t)selected[i].index; // Bin index (0-115)
+      //       fft_batch[3 + i * 2] = (uint8_t)(selected[i].magnitude * 255.0f); // Magnitude (0-255)
+      //     }
+      //     batch_count = 1;
+      //   } else {
+      //     // Additional frame - append to batch
+      //     size_t current_batch_size = 1; // Frame count byte
           
-          // Calculate current batch size
-          for (int f = 0; f < batch_count; f++) {
-            size_t frame_offset = 1; // Skip frame count
-            for (int prev_f = 0; prev_f < f; prev_f++) {
-              uint8_t prev_peak_count = fft_batch[frame_offset];
-              frame_offset += 1 + (prev_peak_count * 2);
-            }
-            uint8_t peak_count = fft_batch[frame_offset];
-            current_batch_size += 1 + (peak_count * 2);
-          }
+      //     // Calculate current batch size
+      //     for (int f = 0; f < batch_count; f++) {
+      //       size_t frame_offset = 1; // Skip frame count
+      //       for (int prev_f = 0; prev_f < f; prev_f++) {
+      //         uint8_t prev_peak_count = fft_batch[frame_offset];
+      //         frame_offset += 1 + (prev_peak_count * 2);
+      //       }
+      //       uint8_t peak_count = fft_batch[frame_offset];
+      //       current_batch_size += 1 + (peak_count * 2);
+      //     }
           
-          // Check if new frame fits
-          if (current_batch_size + frame_size < BATCH_BUFFER_SIZE) {
-            // Append new frame
-            fft_batch[current_batch_size] = (uint8_t)count;
-            for (int i = 0; i < count; i++) {
-              fft_batch[current_batch_size + 1 + i * 2] = (uint8_t)selected[i].index;
-              fft_batch[current_batch_size + 2 + i * 2] = (uint8_t)(selected[i].magnitude * 255.0f);
-            }
-            batch_count++;
-            fft_batch[0] = (uint8_t)batch_count; // Update frame count
-          } else {
-            // Buffer full, send current batch and start new one
-            sendBinaryBatch(fft_batch, current_batch_size);
-            websocket_sends_attempted++;
-            last_websocket_send = millis();
+      //     // Check if new frame fits
+      //     if (current_batch_size + frame_size < BATCH_BUFFER_SIZE) {
+      //       // Append new frame
+      //       fft_batch[current_batch_size] = (uint8_t)count;
+      //       for (int i = 0; i < count; i++) {
+      //         fft_batch[current_batch_size + 1 + i * 2] = (uint8_t)selected[i].index;
+      //         fft_batch[current_batch_size + 2 + i * 2] = (uint8_t)(selected[i].magnitude * 255.0f);
+      //       }
+      //       batch_count++;
+      //       fft_batch[0] = (uint8_t)batch_count; // Update frame count
+      //     } else {
+      //       // Buffer full, send current batch and start new one
+      //       sendBinaryBatch(fft_batch, current_batch_size);
+      //       websocket_sends_attempted++;
+      //       last_websocket_send = millis();
             
-            // Start new batch with current frame
-            fft_batch[0] = 1;
-            fft_batch[1] = (uint8_t)count;
-            for (int i = 0; i < count; i++) {
-              fft_batch[2 + i * 2] = (uint8_t)selected[i].index;
-              fft_batch[3 + i * 2] = (uint8_t)(selected[i].magnitude * 255.0f);
-            }
-            batch_count = 1;
-          }
-        }
+      //       // Start new batch with current frame
+      //       fft_batch[0] = 1;
+      //       fft_batch[1] = (uint8_t)count;
+      //       for (int i = 0; i < count; i++) {
+      //         fft_batch[2 + i * 2] = (uint8_t)selected[i].index;
+      //         fft_batch[3 + i * 2] = (uint8_t)(selected[i].magnitude * 255.0f);
+      //       }
+      //       batch_count = 1;
+      //     }
+      //   }
         
-        // Send batch when we have enough cycles or enough time has passed
-        uint32_t current_time = millis();
-        if (batch_count >= batch_size || (current_time - last_websocket_send >= websocket_interval_ms)) {
-          // Calculate final batch size
-          size_t final_batch_size = 1; // Frame count byte
-          for (int f = 0; f < batch_count; f++) {
-            size_t frame_offset = 1;
-            for (int prev_f = 0; prev_f < f; prev_f++) {
-              uint8_t prev_peak_count = fft_batch[frame_offset];
-              frame_offset += 1 + (prev_peak_count * 2);
-            }
-            uint8_t peak_count = fft_batch[frame_offset];
-            final_batch_size += 1 + (peak_count * 2);
-          }
+      //   // Send batch when we have enough cycles or enough time has passed
+      //   uint32_t current_time = millis();
+      //   if (batch_count >= batch_size || (current_time - last_websocket_send >= websocket_interval_ms)) {
+      //     // Calculate final batch size
+      //     size_t final_batch_size = 1; // Frame count byte
+      //     for (int f = 0; f < batch_count; f++) {
+      //       size_t frame_offset = 1;
+      //       for (int prev_f = 0; prev_f < f; prev_f++) {
+      //         uint8_t prev_peak_count = fft_batch[frame_offset];
+      //         frame_offset += 1 + (prev_peak_count * 2);
+      //       }
+      //       uint8_t peak_count = fft_batch[frame_offset];
+      //       final_batch_size += 1 + (peak_count * 2);
+      //     }
           
-          sendBinaryBatch(fft_batch, final_batch_size);
-          websocket_sends_attempted++;
-          last_websocket_send = current_time;
+      //     sendBinaryBatch(fft_batch, final_batch_size);
+      //     websocket_sends_attempted++;
+      //     last_websocket_send = current_time;
           
-          // Reset batch
-          batch_count = 0;
-        }
-      }
+      //     // Reset batch
+      //     batch_count = 0;
+      //   }
+      // }
 
       // Memory monitoring every 5 seconds
       uint32_t current_time = millis();
@@ -393,8 +399,6 @@ static void fft_task(void *param) {
         uint32_t current_heap = ESP.getFreeHeap();
         int32_t heap_change = (int32_t)current_heap - (int32_t)initial_heap;
         
-        ESP_LOGI("fft", "MEMORY: Heap=%d, Change=%d, WS_clients=%d", 
-                 current_heap, heap_change, getWebSocketClientCount());
         
         last_memory_check = current_time;
         

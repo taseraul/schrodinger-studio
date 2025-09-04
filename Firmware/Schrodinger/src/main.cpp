@@ -3,7 +3,6 @@
 #include "webserver.hpp"
 #include "now.hpp"
 #include "bt.hpp"
-#include "bt_monitor.hpp"
 #include "memory_manager.hpp"
 #include "esp_bt.h"
 #include "esp_log.h"
@@ -16,8 +15,7 @@ void setup() {
     Serial.begin(115200);
     ESP_LOGI(TAG, "=== SCHRODINGER FIRMWARE START ===");
     
-    // Print initial memory status
-    ESP_LOGI(TAG, "Initial heap: %d bytes, PSRAM: %d bytes", ESP.getFreeHeap(), ESP.getFreePsram());
+    ESP_LOGI(TAG, "Initial heap: %d bytes, PSRAM: %d bytes", ESP.getFreeHeap(), ESP.getFreePsram()); // Print initial memory status
     
     // Release BLE memory for Classic Bluetooth to free up resources
     esp_err_t ret = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
@@ -28,27 +26,16 @@ void setup() {
     }
     ESP_LOGI(TAG, "After BLE release - Heap: %d bytes", ESP.getFreeHeap());
     
-    // Configure WiFi-Bluetooth coexistence BEFORE initializing either
-    esp_wifi_set_ps(WIFI_PS_NONE);  // Disable WiFi power save for better coexistence
-    
     // Initialize WiFi first to establish network connection
     wifi_init();
     ESP_LOGI(TAG, "After WiFi init - Heap: %d bytes", ESP.getFreeHeap());
-    
-    // Initialize memory manager
-    memory_manager_init();
-    
-    // Initialize Bluetooth monitoring
-    bt_monitor_init();
     
     // Small delay to ensure WiFi is stable before starting Bluetooth
     ESP_LOGI(TAG, "Waiting before Bluetooth initialization...");
     delay(2000);  // Increased delay to ensure stability
     
-    // CRITICAL: Ensure I2S is not initialized elsewhere before BT
-    ESP_LOGI(TAG, "Starting Bluetooth A2DP initialization...");
-    
     // Initialize Bluetooth A2DP sink
+    ESP_LOGI(TAG, "Starting Bluetooth A2DP initialization...");
     bt_init();
     ESP_LOGI(TAG, "After BT init - Heap: %d bytes", ESP.getFreeHeap());
     
@@ -100,7 +87,6 @@ void loop() {
         uint32_t freeHeap = ESP.getFreeHeap();
         uint32_t freePsram = ESP.getFreePsram();
         uint32_t largestBlock = ESP.getMaxAllocHeap();
-        BtConnectionState btState = get_bt_state();
         
         // Track minimum heap seen
         if (freeHeap < minHeapSeen) {
@@ -114,17 +100,9 @@ void loop() {
         
         int32_t heapChange = (int32_t)freeHeap - (int32_t)initialHeap;
         
-        // Enhanced memory logging with leak detection
-        ESP_LOGI(TAG, "MEMORY: Heap=%d (Δ%d), Min=%d, PSRAM=%d, Block=%d, BT=%d", 
-                 freeHeap, heapChange, minHeapSeen, freePsram, largestBlock, btState);
-        
-        // Detect potential memory leaks
-        if (heapChange < -15000) {
-            ESP_LOGW(TAG, "MEMORY LEAK WARNING: Heap dropped %d bytes from baseline", -heapChange);
-        }
-        
-        // Log WebSocket client count for correlation
-        ESP_LOGI(TAG, "WebSocket clients: %d", getWebSocketClientCount());
+        // Enhanced memory logging
+        ESP_LOGI(TAG, "MEMORY: Heap=%d (Δ%d), Min=%d, PSRAM=%d, Block=%d", 
+                 freeHeap, heapChange, minHeapSeen, freePsram, largestBlock);
         
         // Perform WebSocket health check and cleanup
         websocketHealthCheck();

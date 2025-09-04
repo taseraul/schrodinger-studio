@@ -8,8 +8,8 @@
 #include "Arduino_JSON.h"
 #include "now.hpp"
 #include "esp_heap_caps.h"
-#include "bt_monitor.hpp"
 #include "memory_manager.hpp"
+#include "esp_wifi.h"
 #include <map>
 #include <set>
 
@@ -28,6 +28,8 @@ void wifi_init() {
   uint8_t retryCount = 30;
   ESP_LOGV("wifi", "Server MAC Address: %s", WiFi.macAddress());
 
+  esp_wifi_set_ps(WIFI_PS_NONE);  // Disable WiFi power save for better coexistence
+  
   // Set device as both Station and Soft AP
   WiFi.mode(WIFI_AP_STA);
 
@@ -41,11 +43,11 @@ void wifi_init() {
     WiFi.softAP("Schrodinger");
   }
 
-  ESP_LOGV("wifi", "Soft AP MAC Address: %s", WiFi.softAPmacAddress());
-
   channel = WiFi.channel();
-  ESP_LOGV("wifi", "Station IP Address: ", WiFi.localIP());
-  ESP_LOGV("wifi", "Wi-Fi Channel: ", channel);
+  
+  ESP_LOGI("wifi", "Soft AP MAC Address: %s", WiFi.softAPmacAddress());
+  ESP_LOGI("wifi", "Station IP Address: ", WiFi.localIP());
+  ESP_LOGI("wifi", "Wi-Fi Channel: ", channel);
 }
 
 // Initialize SPIFFS
@@ -60,6 +62,8 @@ void fs_init() {
 // Handle incoming WebSocket messages
 void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
   AwsFrameInfo *info = (AwsFrameInfo *)arg;
+
+  ESP_LOGI(TAG, "Received update for device");
   if (!(info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT)) return;
 
   // Use PSRAM buffer instead of String for message processing
@@ -161,12 +165,12 @@ void notifyClients(String json) {
     return; // No clients connected
   }
   
-  // Check memory before attempting to send
-  uint32_t free_heap = ESP.getFreeHeap();
-  if (free_heap < 15000) { // Critical memory threshold
-    ESP_LOGW(TAG, "Low memory (%d bytes), skipping WebSocket send", free_heap);
-    return;
-  }
+  // // Check memory before attempting to send
+  // uint32_t free_heap = ESP.getFreeHeap();
+  // if (free_heap < 15000) { // Critical memory threshold
+  //   ESP_LOGW(TAG, "Low memory (%d bytes), skipping WebSocket send", free_heap);
+  //   return;
+  // }
   
   // Clean up unresponsive clients first
   ws.cleanupClients();
@@ -186,84 +190,8 @@ void notifyClients(String json) {
     return;
   }
   
-  uint32_t current_time = millis();
-  uint32_t successful_sends = 0;
-  uint32_t failed_sends = 0;
-  uint32_t skipped_sends = 0;
-  
-  try {
-    // Send to each client individually with health monitoring
-    auto& clients = ws.getClients();
-    for (auto& client : clients) {
-      if (client.status() != WS_CONNECTED) {
-        continue;
-      }
-      
-      uint32_t client_id = client.id();
-      ClientStats& stats = client_stats[client_id];
-      
-      // Check if client is responsive
-      if (!stats.is_responsive) {
-        skipped_sends++;
-        continue;
-      }
-      
-      // Check client queue health before sending
-      if (client.queueIsFull()) {
-        stats.consecutive_failures++;
-        failed_sends++;
-        
-        // Mark client as unresponsive after 5 consecutive failures
-        if (stats.consecutive_failures >= 5) {
-          stats.is_responsive = false;
-          ESP_LOGW(TAG, "Client %d marked unresponsive (queue full)", client_id);
-          
-          // Close unresponsive clients to free resources
-          client.close(1000, "Queue overflow");
-          continue;
-        }
-        
-        ESP_LOGD(TAG, "Client %d queue full, skipping send", client_id);
-        continue;
-      }
-      
-      // Attempt to send to this client
-      bool send_success = client.text((const uint8_t*)json_cstr, json_len);
-      
-      if (send_success) {
-        stats.messages_sent++;
-        stats.last_success_time = current_time;
-        stats.consecutive_failures = 0;
-        stats.is_responsive = true;
-        successful_sends++;
-      } else {
-        stats.messages_failed++;
-        stats.consecutive_failures++;
-        failed_sends++;
-        
-        // Mark as unresponsive after 3 consecutive send failures
-        if (stats.consecutive_failures >= 3) {
-          stats.is_responsive = false;
-          ESP_LOGW(TAG, "Client %d marked unresponsive (send failures)", client_id);
-        }
-      }
-    }
-    
-    // Log send statistics periodically
-    static uint32_t send_count = 0;
-    send_count++;
-    
-    if (send_count % 50 == 0) { // Log every 50th send
-      ESP_LOGI(TAG, "WebSocket send #%d: %d OK, %d failed, %d skipped (%d bytes to %d clients)", 
-               send_count, successful_sends, failed_sends, skipped_sends, json_len, ws.count());
-    }
-    
-    // Clean up client stats periodically
-    if (current_time - last_stats_cleanup > 30000) { // Every 30 seconds
-      cleanupClientStats();
-      last_stats_cleanup = current_time;
-    }
-    
+  try{
+    ws.textAll(json_cstr);
   } catch (const std::exception& e) {
     ESP_LOGE(TAG, "WebSocket send exception: %s", e.what());
   } catch (...) {
@@ -277,12 +205,12 @@ void sendBinaryBatch(const uint8_t* data, size_t length) {
     return; // No clients connected
   }
   
-  // Check memory before attempting to send
-  uint32_t free_heap = ESP.getFreeHeap();
-  if (free_heap < 15000) { // Critical memory threshold
-    ESP_LOGW(TAG, "Low memory (%d bytes), skipping binary WebSocket send", free_heap);
-    return;
-  }
+  // // Check memory before attempting to send
+  // uint32_t free_heap = ESP.getFreeHeap();
+  // if (free_heap < 15000) { // Critical memory threshold
+  //   ESP_LOGW(TAG, "Low memory (%d bytes), skipping binary WebSocket send", free_heap);
+  //   return;
+  // }
   
   // Clean up unresponsive clients first
   ws.cleanupClients();
@@ -298,78 +226,8 @@ void sendBinaryBatch(const uint8_t* data, size_t length) {
     return;
   }
   
-  uint32_t current_time = millis();
-  uint32_t successful_sends = 0;
-  uint32_t failed_sends = 0;
-  uint32_t skipped_sends = 0;
-  
   try {
-    // Send to each client individually with health monitoring
-    auto& clients = ws.getClients();
-    for (auto& client : clients) {
-      if (client.status() != WS_CONNECTED) {
-        continue;
-      }
-      
-      uint32_t client_id = client.id();
-      ClientStats& stats = client_stats[client_id];
-      
-      // Check if client is responsive
-      if (!stats.is_responsive) {
-        skipped_sends++;
-        continue;
-      }
-      
-      // Check client queue health before sending
-      if (client.queueIsFull()) {
-        stats.consecutive_failures++;
-        failed_sends++;
-        
-        // Mark client as unresponsive after 5 consecutive failures
-        if (stats.consecutive_failures >= 5) {
-          stats.is_responsive = false;
-          ESP_LOGW(TAG, "Client %d marked unresponsive (binary queue full)", client_id);
-          
-          // Close unresponsive clients to free resources
-          client.close(1000, "Binary queue overflow");
-          continue;
-        }
-        
-        ESP_LOGD(TAG, "Client %d binary queue full, skipping send", client_id);
-        continue;
-      }
-      
-      // Attempt to send binary data to this client
-      bool send_success = client.binary(data, length);
-      
-      if (send_success) {
-        stats.messages_sent++;
-        stats.last_success_time = current_time;
-        stats.consecutive_failures = 0;
-        stats.is_responsive = true;
-        successful_sends++;
-      } else {
-        stats.messages_failed++;
-        stats.consecutive_failures++;
-        failed_sends++;
-        
-        // Mark as unresponsive after 3 consecutive send failures
-        if (stats.consecutive_failures >= 3) {
-          stats.is_responsive = false;
-          ESP_LOGW(TAG, "Client %d marked unresponsive (binary send failures)", client_id);
-        }
-      }
-    }
-    
-    // Log send statistics periodically
-    static uint32_t binary_send_count = 0;
-    binary_send_count++;
-    
-    if (binary_send_count % 50 == 0) { // Log every 50th send
-      ESP_LOGI(TAG, "Binary WebSocket send #%d: %d OK, %d failed, %d skipped (%d bytes to %d clients)", 
-               binary_send_count, successful_sends, failed_sends, skipped_sends, length, ws.count());
-    }
-    
+    ws.binaryAll(data, length);
   } catch (const std::exception& e) {
     ESP_LOGE(TAG, "Binary WebSocket send exception: %s", e.what());
   } catch (...) {
@@ -404,11 +262,6 @@ void cleanupClientStats() {
            active_clients.size(), client_stats.size());
 }
 
-// Get WebSocket client count
-int getWebSocketClientCount() {
-  return ws.count();
-}
-
 // Enhanced WebSocket health monitoring and cleanup
 void websocketHealthCheck() {
   static uint32_t last_health_check = 0;
@@ -441,12 +294,12 @@ void websocketHealthCheck() {
     ESP_LOGI(TAG, "After cleanup: %d clients remaining, %d bytes free", ws.count(), ESP.getFreeHeap());
   } else {
     // Normal cleanup - remove unresponsive clients
-    ws.cleanupClients(8); // Allow up to 8 clients normally
+    ws.cleanupClients(2); // Allow up to 8 clients normally
   }
   
   // Log WebSocket health status
   if (ws.count() > 0) {
-    ESP_LOGI(TAG, "WebSocket health: %d clients, %d bytes free", ws.count(), free_heap);
+    ESP_LOGD(TAG, "WebSocket health: %d clients, %d bytes free", ws.count(), free_heap);
   }
 }
 
@@ -459,21 +312,6 @@ void webserver_init() {
   Serial.printf("Free PSRAM before webserver init: %d bytes\n", ESP.getFreePsram());
   
   initWebSocket();
-
-  // Add memory status endpoint for debugging
-  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
-    // Use minimal memory for status response
-    char json[256];
-    snprintf(json, sizeof(json), 
-      "{\"heap\":%d,\"psram\":%d,\"wifi_connected\":%s,\"wifi_rssi\":%d,\"bt_state\":%d,\"bt_audio_active\":%s,\"uptime\":%lu}",
-      ESP.getFreeHeap(), ESP.getFreePsram(),
-      WiFi.status() == WL_CONNECTED ? "true" : "false",
-      WiFi.RSSI(), get_bt_state(),
-      is_bt_audio_active() ? "true" : "false",
-      millis()
-    );
-    request->send(200, "application/json", json);
-  });
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     // Check memory health before serving files
@@ -511,14 +349,6 @@ void webserver_init() {
     ESP_LOGI(TAG, "Serving main page with %d bytes heap free, %d largest block", 
              ESP.getFreeHeap(), largestBlock);
     request->send(SPIFFS,"/client.html" ,"text/html");
-  });
-
-  // Add lightweight memory info endpoint
-  server.on("/mem", HTTP_GET, [](AsyncWebServerRequest *request) {
-    char response[64];
-    snprintf(response, sizeof(response), "Heap: %d, PSRAM: %d", 
-             ESP.getFreeHeap(), ESP.getFreePsram());
-    request->send(200, "text/plain", response);
   });
 
   // Add error handler for better debugging

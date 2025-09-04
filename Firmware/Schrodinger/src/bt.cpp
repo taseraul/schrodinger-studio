@@ -5,111 +5,16 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-#include "bt_monitor.hpp"
 #include "esp_log.h"
-#include "circular_buffer.hpp"
 
 static const char* TAG = "bt";
 
-NumberFormatConverterStream scaledBt;
-BluetoothA2DPSink a2dp_sink(scaledBt);
+char *btName = "Schrodinger_Test";
+
+BluetoothA2DPSink a2dp_sink;
 
 #define BT_TASK_STACK_SIZE 8192
 #define BT_TASK_PRIORITY   10
-
-// Circular buffer for BT samples (16KB in PSRAM)
-static CircularBuffer* bt_circular_buffer = nullptr;
-
-// Debug counters
-static uint32_t total_samples_received = 0;
-static uint32_t buffer_overflow_count = 0;
-
-void receiveBtSamples(const uint8_t* data, uint32_t length) 
-{
-  static uint32_t callback_count = 0;
-  callback_count++;
-  
-  if (!bt_circular_buffer || !data || length == 0) {
-    ESP_LOGW(TAG, "BT callback %d: Invalid params - buffer:%p data:%p length:%d", 
-             callback_count, bt_circular_buffer, data, length);
-    return;
-  }
-  
-  // Log first few callbacks and then periodically
-  if (callback_count <= 5 || callback_count % 100 == 0) {
-    ESP_LOGI(TAG, "BT callback %d: Received %d bytes", callback_count, length);
-  }
-  
-  // Update BT state to indicate audio is playing
-  bt_state_changed(BT_AUDIO_PLAYING);
-  
-  // Write samples to circular buffer (converts 16-bit to 32-bit internally)
-  if (bt_circular_buffer->write_samples_16bit(data, length)) {
-    total_samples_received += length / 4;  // Count sample pairs
-    
-    // Log periodically for debugging (every 1000 sample pairs)
-    if (total_samples_received % 1000 == 0) {
-      ESP_LOGI(TAG, "BT samples: %d pairs, buffer: %.1f%%, available: %d pairs", 
-               total_samples_received, bt_circular_buffer->get_utilization(),
-               bt_circular_buffer->get_sample_count());
-    }
-  } else {
-    buffer_overflow_count++;
-    ESP_LOGW(TAG, "BT buffer write failed %d times", buffer_overflow_count);
-  }
-}
-
-bool readBtSamples(uint32_t* dest, size_t length) {
-  static uint32_t read_attempts = 0;
-  read_attempts++;
-  
-  if (!bt_circular_buffer || !dest || length < SAMPLES * 2) {
-    ESP_LOGW(TAG, "Read attempt %d: Invalid params - buffer:%p dest:%p length:%d", 
-             read_attempts, bt_circular_buffer, dest, length);
-    return false;
-  }
-
-  size_t available_samples = bt_circular_buffer->get_sample_count();
-  
-  // Log first few attempts and then periodically
-  if (read_attempts <= 10 || read_attempts % 100 == 0) {
-    ESP_LOGI(TAG, "Read attempt %d: Available samples: %d, need: %d", 
-             read_attempts, available_samples, SAMPLES);
-  }
-
-  // Read exactly SAMPLES sample pairs from circular buffer
-  bool success = bt_circular_buffer->read_samples_32bit(dest, SAMPLES);
-  
-  if (success && (read_attempts <= 10 || read_attempts % 100 == 0)) {
-    ESP_LOGI(TAG, "Read attempt %d: SUCCESS - Read %d sample pairs", read_attempts, SAMPLES);
-  } else if (!success && read_attempts % 50 == 0) {
-    ESP_LOGW(TAG, "Read attempt %d: FAILED - Not enough samples (have: %d, need: %d)", 
-             read_attempts, available_samples, SAMPLES);
-  }
-  
-  return success;
-}
-
-// // High-priority task: reads samples from BT
-// void bt_task(void *param) {
-//   size_t bytes_read;
-//   uint8_t temp_buffer[SAMPLES * 8];  // 2 channels × 4 bytes = 8 bytes/sample pair
-
-//   while (true) {
-//     size_t res = scaledBt.readBytes(temp_buffer, sizeof(temp_buffer));
-
-//     if (res == sizeof(temp_buffer)) {
-//       if (xSemaphoreTake(buffer_mutex, 0)) {
-//         memcpy(samples, temp_buffer, sizeof(temp_buffer));
-//         buffer_ready = true;
-//         xSemaphoreGive(buffer_mutex);
-//         ESP_LOGI("bt","Samples read");
-//       }
-//     }
-
-//     vTaskDelay(pdMS_TO_TICKS(2));
-//   }
-// }
 
 void bt_init() {
   ESP_LOGI(TAG, "Initializing Bluetooth A2DP Sink...");
@@ -129,49 +34,40 @@ void bt_init() {
   WiFi.mode(WIFI_OFF);
   delay(500);  // Allow WiFi to fully shut down
   
-  // Initialize circular buffer for BT samples (16KB in PSRAM)
-  bt_circular_buffer = new CircularBuffer(16384);  // 16KB
-  if (!bt_circular_buffer || !bt_circular_buffer->init()) {
-    ESP_LOGE(TAG, "Failed to initialize BT circular buffer");
-    if (bt_circular_buffer) {
-      delete bt_circular_buffer;
-      bt_circular_buffer = nullptr;
-    }
-    return;
-  }
-  ESP_LOGI(TAG, "BT circular buffer initialized successfully");
-  
   // Configure I2S settings BEFORE starting A2DP to prevent conflicts
   // Use different pins than the existing I2S RX configuration
   i2s_pin_config_t my_pin_config = {
-      .bck_io_num   = 26,  // Changed from 14 to avoid conflict
-      .ws_io_num    = 25,  // Changed from 15 to avoid conflict  
-      .data_out_num = 32,
-      .data_in_num  = I2S_PIN_NO_CHANGE
+      // .mck_io_num   = 0,
+      .bck_io_num   = 14,
+      .ws_io_num    = 13,  
+      .data_out_num = 15,
+      .data_in_num  = 4,
   };
 
   i2s_config_t i2s_config = {
-      .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+      .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX),
       .sample_rate          = 44100,
-      .bits_per_sample      = (i2s_bits_per_sample_t)16,  // Changed from 32 to 16 to save memory
+      .bits_per_sample      = (i2s_bits_per_sample_t)32,  // Changed from 32 to 16 to save memory
       .channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT,
       .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_STAND_I2S),
       .intr_alloc_flags     = 0,
-      .dma_buf_count        = 4,  // Further reduced to save memory
-      .dma_buf_len          = 32, // Further reduced to save memory
-      .use_apll             = false,  // Disabled to save memory
+      .dma_buf_count        = 10,
+      .dma_buf_len          = 64,
+      .use_apll             = true,  // Disabled to save memory
       .tx_desc_auto_clear   = true
   };
   
   // Set I2S configuration before starting A2DP
   a2dp_sink.set_i2s_config(i2s_config);
   a2dp_sink.set_pin_config(my_pin_config);
+  a2dp_sink.set_i2s_port(I2S_NUM_0);
   
   // Set up the stream reader callback
-  a2dp_sink.set_stream_reader(receiveBtSamples, false);
+  // a2dp_sink.set_stream_reader(receiveBtSamples, true);
+  // a2dp_sink.set_i2s_active(true);
   
   // Configure A2DP with optimized settings for memory usage
-  a2dp_sink.set_auto_reconnect(false); // Disable auto-reconnect to save resources
+  // a2dp_sink.set_auto_reconnect(true); // Disable auto-reconnect to save resources
   
   ESP_LOGI(TAG, "Starting A2DP sink with name: Schrodinger2");
   
@@ -181,7 +77,7 @@ void bt_init() {
   
   // Start the A2DP sink with error handling
   try {
-    a2dp_sink.start("Schrodinger2");
+    a2dp_sink.start("Schrodinger2",true);
     ESP_LOGI(TAG, "A2DP sink started successfully");
   } catch (const std::exception& e) {
     ESP_LOGE(TAG, "A2DP sink start failed: %s", e.what());
@@ -213,18 +109,6 @@ void bt_deinit() {
   
   // Stop A2DP sink
   a2dp_sink.end();
-  
-  // Clean up circular buffer
-  if (bt_circular_buffer) {
-    bt_circular_buffer->deinit();
-    delete bt_circular_buffer;
-    bt_circular_buffer = nullptr;
-    ESP_LOGI(TAG, "BT circular buffer cleaned up");
-  }
-  
-  // Reset counters
-  total_samples_received = 0;
-  buffer_overflow_count = 0;
   
   ESP_LOGI(TAG, "Bluetooth A2DP Sink deinitialized");
 }

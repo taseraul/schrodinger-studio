@@ -5,8 +5,8 @@ BluetoothA2DPSink a2dp_sink;
 void setup() {
   i2s_pin_config_t my_pin_config = {
         .bck_io_num = 14,
-        .ws_io_num = 15,
-        .data_out_num = 32,
+        .ws_io_num = 13,
+        .data_out_num = 15,
         .data_in_num = I2S_PIN_NO_CHANGE
   };
   
@@ -25,7 +25,7 @@ void setup() {
   };
   a2dp_sink.set_i2s_config(i2s_config);
   a2dp_sink.set_pin_config(my_pin_config);
-  a2dp_sink.start("Schrodinger");
+  a2dp_sink.start("Schrodingerxx");
 }
 
 void loop() {

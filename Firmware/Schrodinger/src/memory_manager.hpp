@@ -5,7 +5,6 @@
 #include "esp_heap_caps.h"
 
 // Memory management functions
-void memory_manager_init();
 void force_garbage_collection();
 bool check_memory_health();
 void print_memory_info();

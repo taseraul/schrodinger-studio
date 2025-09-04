@@ -5,11 +5,6 @@
 
 static const char* TAG = "memory";
 
-void memory_manager_init() {
-    ESP_LOGI(TAG, "Memory Manager initialized");
-    print_memory_info();
-}
-
 void force_garbage_collection() {
     ESP_LOGD(TAG, "Forcing garbage collection");
     
