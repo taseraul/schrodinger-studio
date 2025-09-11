@@ -61,23 +61,76 @@ void fs_init() {
 
 // Handle incoming WebSocket messages
 void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
-  AwsFrameInfo *info = (AwsFrameInfo *)arg;
-
-  ESP_LOGI(TAG, "Received update for device");
-  if (!(info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT)) return;
-
-  // Use PSRAM buffer instead of String for message processing
-  char* msg_buffer = (char*)malloc_psram_fallback(len + 1);
-  if (!msg_buffer) {
-    ESP_LOGW(TAG, "Failed to allocate message buffer");
+  // Validate all input parameters first
+  if (!arg) {
+    ESP_LOGW(TAG, "Invalid WebSocket message: arg is NULL");
     return;
   }
   
-  memcpy(msg_buffer, data, len);
-  msg_buffer[len] = '\0';  // Null terminate
+  if (!data || len == 0 || len > 1024) {  // Reduced max size to prevent memory issues
+    ESP_LOGW(TAG, "Invalid WebSocket message: data=%p, len=%d", data, len);
+    return;
+  }
+
+  AwsFrameInfo *info = (AwsFrameInfo *)arg;
+  
+  // Validate the frame info structure
+  if (!info) {
+    ESP_LOGW(TAG, "Invalid WebSocket message: info is NULL after cast");
+    return;
+  }
+
+  ESP_LOGI(TAG, "Received WebSocket message: len=%d, info->len=%d, opcode=%d", len, info->len, info->opcode);
+  
+  // Validate frame info fields
+  if (!(info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT)) {
+    ESP_LOGW(TAG, "Invalid frame: final=%d, index=%d, len=%d, expected_len=%d, opcode=%d", 
+             info->final, info->index, info->len, len, info->opcode);
+    return;
+  }
+
+  // Check memory health before attempting allocation
+  if (!check_memory_health()) {
+    ESP_LOGW(TAG, "Memory health check failed, skipping WebSocket message processing");
+    return;
+  }
+
+  // Use stack buffer for small messages to avoid heap allocation issues
+  static char stack_buffer[512];  // Static buffer to avoid stack overflow
+  char* msg_buffer = nullptr;
+  bool use_heap = false;
+  
+  if (len < sizeof(stack_buffer) - 1) {
+    // Use stack buffer for small messages
+    msg_buffer = stack_buffer;
+  } else {
+    // Only use heap for larger messages
+    use_heap = true;
+    msg_buffer = (char*)malloc_psram_fallback(len + 1);
+    if (!msg_buffer) {
+      ESP_LOGW(TAG, "Failed to allocate message buffer of size %d", len + 1);
+      return;
+    }
+  }
+  
+  // Copy data safely
+  if (len > 0 && data && msg_buffer) {
+    memmove(msg_buffer, data, len);
+    msg_buffer[len] = '\0';  // Null terminate
+  } else {
+    ESP_LOGE(TAG, "Critical error: invalid parameters for memory copy");
+    if (use_heap && msg_buffer) {
+      free_psram_fallback(msg_buffer);
+    }
+    return;
+  }
   
   JSONVar json = JSON.parse(msg_buffer);
-  free_psram_fallback(msg_buffer);
+  
+  // Free heap buffer if used
+  if (use_heap && msg_buffer) {
+    free_psram_fallback(msg_buffer);
+  }
 
   if (JSON.typeof(json) != "object") {
     ESP_LOGW(TAG, "Invalid JSON received");
@@ -133,7 +186,12 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
       break;
     case WS_EVT_DATA:
       ESP_LOGV(TAG,"WebSocket text message received");
-      handleWebSocketMessage(arg, data, len); // Enable if needed
+      // Additional safety checks before calling handleWebSocketMessage
+      if (arg && data && len > 0) {
+        handleWebSocketMessage(arg, data, len);
+      } else {
+        ESP_LOGW(TAG, "Invalid WebSocket data event: arg=%p, data=%p, len=%d", arg, data, len);
+      }
       break;
     case WS_EVT_PONG:
     case WS_EVT_ERROR:

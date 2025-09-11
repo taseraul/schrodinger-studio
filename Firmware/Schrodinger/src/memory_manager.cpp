@@ -61,16 +61,48 @@ size_t get_largest_free_block() {
 }
 
 void* malloc_psram_fallback(size_t size) {
+    // Validate input size
+    if (size == 0 || size > 65536) {  // Reasonable upper limit
+        ESP_LOGW(TAG, "Invalid allocation size: %d", size);
+        return nullptr;
+    }
+    
+    // Check memory health before allocation
+    uint32_t free_heap = ESP.getFreeHeap();
+    if (free_heap < CRITICAL_HEAP_THRESHOLD) {
+        ESP_LOGW(TAG, "Heap critically low (%d bytes), refusing allocation of %d bytes", free_heap, size);
+        return nullptr;
+    }
+    
+    void* ptr = nullptr;
+    
     // Try PSRAM first for large allocations
     if (size > 1024) {
-        void* ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+        ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
         if (ptr) {
+            ESP_LOGD(TAG, "Allocated %d bytes in PSRAM at %p", size, ptr);
             return ptr;
         }
+        ESP_LOGD(TAG, "PSRAM allocation failed for %d bytes, trying internal RAM", size);
     }
     
     // Fallback to internal RAM
-    return heap_caps_malloc(size, MALLOC_CAP_INTERNAL);
+    ptr = heap_caps_malloc(size, MALLOC_CAP_INTERNAL);
+    if (ptr) {
+        ESP_LOGD(TAG, "Allocated %d bytes in internal RAM at %p", size, ptr);
+    } else {
+        ESP_LOGW(TAG, "Failed to allocate %d bytes in any memory type", size);
+        // Try to force garbage collection and retry once
+        force_garbage_collection();
+        ptr = heap_caps_malloc(size, MALLOC_CAP_INTERNAL);
+        if (ptr) {
+            ESP_LOGI(TAG, "Allocation succeeded after garbage collection: %d bytes at %p", size, ptr);
+        } else {
+            ESP_LOGE(TAG, "Allocation failed even after garbage collection: %d bytes", size);
+        }
+    }
+    
+    return ptr;
 }
 
 void free_psram_fallback(void* ptr) {

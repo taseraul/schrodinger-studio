@@ -157,17 +157,17 @@ void setBand(uint8_t band, uint8_t index) {
   // setDeviceState(broadcastAddr,index);
 }
 
-// static void updateColor(const uint8_t* color, uint8_t index) {
-//   JSONVar deviceUpdate;
-//   deviceUpdate["id"]       = index;
-//   deviceUpdate["r"]        = color[0];
-//   deviceUpdate["g"]        = color[1];
-//   deviceUpdate["b"]        = color[2];
-//   moodConfig[index].rgb[0] = color[0];
-//   moodConfig[index].rgb[1] = color[1];
-//   moodConfig[index].rgb[2] = color[2];
-//   notifyClients(JSON.stringify(deviceUpdate));
-// }
+static void updateColor(const uint8_t* color, uint8_t index) {
+  JSONVar deviceUpdate;
+  deviceUpdate["id"]       = index;
+  deviceUpdate["r"]        = color[0];
+  deviceUpdate["g"]        = color[1];
+  deviceUpdate["b"]        = color[2];
+  moodConfig[index].rgb[0] = color[0];
+  moodConfig[index].rgb[1] = color[1];
+  moodConfig[index].rgb[2] = color[2];
+  notifyClients(JSON.stringify(deviceUpdate));
+}
 
 void setColor(const uint8_t* color, uint8_t index) {
   moodConfig[index].rgb[0] = color[0];
